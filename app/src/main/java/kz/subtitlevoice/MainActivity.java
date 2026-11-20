@@ -145,6 +145,7 @@ public class MainActivity extends AppCompatActivity {
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
+        getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         prefs = getSharedPreferences("subtitle_voice", MODE_PRIVATE);
         widthFrac = prefs.getFloat("roiWidth", .82f);
         heightFrac = prefs.getFloat("roiHeight", .17f);
@@ -474,9 +475,7 @@ public class MainActivity extends AppCompatActivity {
         JSONArray a=entity.optJSONObject("claims")==null?null:entity.optJSONObject("claims").optJSONArray(property);
         if(a==null||a.length()==0)return "";
         JSONObject snak=a.optJSONObject(0)==null?null:a.optJSONObject(0).optJSONObject("mainsnak");
-        JSONObject value = snak == null ? null :
-    (snak.optJSONObject("datavalue") == null ? null :
-    snak.optJSONObject("datavalue").optJSONObject("value"));
+        JSONObject value=snak==null||snak.optJSONObject("datavalue")==null?null:snak.optJSONObject("datavalue").optJSONObject("value");
         return value==null?"":value.optString("id","");
     }
     private ArrayList<ImportedCharacter> fetchGameCharacters(String game) throws Exception {
