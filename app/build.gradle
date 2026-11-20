@@ -8,8 +8,8 @@ android {
         applicationId 'kz.subtitlevoice'
         minSdk 26
         targetSdk 35
-        versionCode 10
-        versionName '1.10'
+        versionCode 11
+        versionName '1.11'
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_17
@@ -25,4 +25,38 @@ dependencies {
     implementation 'androidx.camera:camera-view:1.5.2'
     implementation 'com.google.mlkit:text-recognition:16.0.1'
     implementation 'com.google.mlkit:translate:17.0.3'
+    implementation 'cz.adaptech.tesseract4android:tesseract4android:4.9.0'
 }
+
+// Fetch the small freely licensed Russian OCR model ONLY ON THE BUILD MACHINE.
+// It is then packaged in the APK. The phone NEVER downloads the model.
+tasks.register('prepareRussianOcrModel') {
+    def model = layout.projectDirectory.file('src/main/assets/tessdata/rus.traineddata')
+    outputs.file(model)
+    doLast {
+        File target = model.asFile
+        if (!target.exists() || target.length() < 1000000) {
+            target.parentFile.mkdirs()
+            File temp = new File(target.parentFile, 'rus.traineddata.tmp')
+            URL url = new URL('https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/rus.traineddata')
+            def connection = url.openConnection()
+            connection.setConnectTimeout(20000)
+            connection.setReadTimeout(40000)
+            try {
+                connection.getInputStream().withCloseable { input ->
+                    temp.withOutputStream { output ->
+                        byte[] buffer = new byte[32768]
+                        int read
+                        while ((read = input.read(buffer)) != -1) output.write(buffer, 0, read)
+                    }
+                }
+                if (temp.length() < 1000000) throw new GradleException('rus.traineddata download incomplete')
+                java.nio.file.Files.move(temp.toPath(), target.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+            } finally {
+                if (temp.exists()) temp.delete()
+            }
+        }
+    }
+}
+tasks.named('preBuild') { dependsOn tasks.named('prepareRussianOcrModel') }
