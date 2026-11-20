@@ -8,6 +8,11 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.RectF;
+import android.graphics.Matrix;
+import android.util.Size;
+import java.nio.ByteBuffer;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -23,6 +28,8 @@ import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.camera.core.CameraSelector;
+import androidx.camera.core.ImageAnalysis;
+import androidx.camera.core.ImageProxy;
 import androidx.camera.core.Preview;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.camera.view.PreviewView;
@@ -45,6 +52,7 @@ import java.util.regex.*;
 /** Camera->cropped OCR->optional offline translation->speech. No screenshot storage. */
 public class MainActivity extends AppCompatActivity {
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
     private final TextRecognizer recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
     private final Map<String, Boolean> characterGender = new LinkedHashMap<>();
     private final ArrayList<Voice> russianVoices = new ArrayList<>();
@@ -63,7 +71,7 @@ public class MainActivity extends AppCompatActivity {
     private long activeSpeakerUntil = 0;
     private long lastSpokenAt = 0;
     private float widthFrac = .82f, heightFrac = .17f, centerYFrac = .80f, speechRate = 1.25f;
-    private int maleIndex = 0, femaleIndex = 0, defaultKind = 0, contrastMode = 1;
+    private int maleIndex = 0, femaleIndex = 0, defaultKind = 0, contrastMode = 0;
     private final ActivityResultLauncher<String> cameraPermission = registerForActivityResult(new ActivityResultContracts.RequestPermission(), allowed -> {
         if (allowed) startCamera(); else show("Нужно разрешение камеры");
     });
@@ -78,7 +86,7 @@ public class MainActivity extends AppCompatActivity {
         maleIndex = prefs.getInt("maleVoice", 0);
         femaleIndex = prefs.getInt("femaleVoice", 0);
         defaultKind = prefs.getInt("defaultKind", 0);
-        contrastMode = prefs.getInt("contrastMode", 1);
+        contrastMode = prefs.getInt("contrastMode", 0);
         loadCharacters();
         buildUi();
         tts = new TextToSpeech(this, code -> handler.post(() -> {
@@ -121,7 +129,7 @@ public class MainActivity extends AppCompatActivity {
         add(content,text("Если у субтитров нет чёрной подложки, попробуй режим «Светлые буквы». Он выделяет текст относительно окружающего фона.",12));
         Spinner contrastSpinner = new Spinner(this);
         contrastSpinner.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
-            new String[]{"Без обработки", "Светлые буквы на пёстром фоне", "Тёмные буквы на пёстром фоне"}));
+            new String[]{"HD без фильтра (рекомендуется)", "Светлые буквы на пёстром фоне", "Тёмные буквы на пёстром фоне"}));
         contrastSpinner.setSelection(contrastMode);
         contrastSpinner.setOnItemSelectedListener(new SpinnerListener(i -> {
             contrastMode=i; prefs.edit().putInt("contrastMode",i).apply();
@@ -220,57 +228,89 @@ public class MainActivity extends AppCompatActivity {
             try{
                 ProcessCameraProvider provider=future.get();provider.unbindAll();
                 Preview p=new Preview.Builder().build();p.setSurfaceProvider(preview.getSurfaceProvider());
-                provider.bindToLifecycle(this,CameraSelector.DEFAULT_BACK_CAMERA,p);
-                started=true;show("Камера готова — наведи на субтитры");handler.postDelayed(scanLoop,350);
+                ImageAnalysis analysis = new ImageAnalysis.Builder()
+                    .setTargetResolution(new Size(1280, 720))
+                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .build();
+                analysis.setAnalyzer(cameraExecutor, frame -> {
+                    if (!started || busy) {frame.close();return;}
+                    busy=true;
+                    try {
+                        Bitmap captured=bitmapFromFrame(frame);
+                        int rotation=frame.getImageInfo().getRotationDegrees();
+                        frame.close();
+                        Bitmap oriented=captured;
+                        if(rotation!=0){
+                            Matrix rotate=new Matrix(); rotate.postRotate(rotation);
+                            oriented=Bitmap.createBitmap(captured,0,0,captured.getWidth(),captured.getHeight(),rotate,true);
+                            captured.recycle();
+                        }
+                        Bitmap cropped=cropToOverlay(oriented);
+                        oriented.recycle();
+                        if(cropped==null){busy=false;return;}
+                        runOnUiThread(()->recognizeFrame(cropped));
+                    }catch(Exception e){
+                        frame.close(); busy=false;
+                        runOnUiThread(()->show("Ошибка кадра: "+e.getMessage()));
+                    }
+                });
+                provider.bindToLifecycle(this,CameraSelector.DEFAULT_BACK_CAMERA,p,analysis);
+                started=true;show("Камера HD готова. Наведи рамку на субтитры");
             }catch(Exception ex){show("Ошибка камеры: "+ex.getMessage());}
         }, ContextCompat.getMainExecutor(this));
     }
-    private final Runnable scanLoop = new Runnable(){@Override public void run(){
-        if(isFinishing()||isDestroyed())return;
-        if(started&&!busy)captureAndRecognize();
-        handler.postDelayed(this,260);
-    }};
-    private void captureAndRecognize(){
-        Bitmap bitmap=preview.getBitmap();
-        if(bitmap==null||bitmap.getWidth()<100||bitmap.getHeight()<100)return;
-        int w=bitmap.getWidth(),h=bitmap.getHeight();
-        int rw=Math.max(16,(int)(w*widthFrac)),rh=Math.max(16,(int)(h*heightFrac));
-        int left=Math.max(0,Math.min(w-rw,(w-rw)/2));
-        int top=Math.max(0,Math.min(h-rh,(int)(h*centerYFrac-rh/2f)));
-        Bitmap cropped;
-        try {
-            cropped = Bitmap.createBitmap(rw,rh,Bitmap.Config.ARGB_8888);
-            Canvas cropCanvas = new Canvas(cropped);
-            cropCanvas.drawBitmap(bitmap,-left,-top,null);
-        } catch(Exception e) {bitmap.recycle();return;}
-        bitmap.recycle();
-        busy=true;
-        final Bitmap processed;
-        try {
-            processed = contrastMode == 0 ? cropped : enhanceSubtitleText(cropped, contrastMode == 1);
-        } catch (Exception ex) {
-            cropped.recycle(); busy=false; show("Ошибка обработки кадра: " + ex.getMessage()); return;
+    private Bitmap bitmapFromFrame(ImageProxy frame){
+        ImageProxy.PlaneProxy plane=frame.getPlanes()[0];
+        int w=frame.getWidth(), h=frame.getHeight();
+        int rowStride=plane.getRowStride();
+        ByteBuffer buffer=plane.getBuffer();
+        byte[] rgba=new byte[w*h*4];
+        for(int row=0;row<h;row++){
+            buffer.position(row*rowStride);
+            buffer.get(rgba,row*w*4,w*4);
         }
-        recognizer.process(InputImage.fromBitmap(processed,0))
-          .addOnSuccessListener(result -> {
-              SubtitleData data=extractSubtitle(result);
-              if (!data.speech.isEmpty() || !data.speaker.isEmpty() || processed == cropped) {
-                  onRecognition(data);
-                  busy=false;
-                  processed.recycle();
-                  if (processed != cropped) cropped.recycle();
-              } else {
-                  // Only if contrast enhancement fails to find any letters, try the original.
-                  recognizer.process(InputImage.fromBitmap(cropped,0))
-                    .addOnSuccessListener(original -> onRecognition(extractSubtitle(original)))
-                    .addOnFailureListener(e -> show("Ошибка OCR: " + e.getMessage()))
-                    .addOnCompleteListener(t -> {busy=false;processed.recycle();cropped.recycle();});
-              }
-          })
-          .addOnFailureListener(e -> {
-              show("Ошибка OCR: " + e.getMessage());
-              busy=false; processed.recycle(); if(processed != cropped) cropped.recycle();
-          });
+        Bitmap bitmap=Bitmap.createBitmap(w,h,Bitmap.Config.ARGB_8888);
+        bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(rgba));
+        return bitmap;
+    }
+    /** PreviewView uses FILL_CENTER; map the visible rectangle back to full-resolution frame. */
+    private Bitmap cropToOverlay(Bitmap frame){
+        int vw=preview.getWidth(),vh=preview.getHeight();
+        if(vw<=0||vh<=0)return null;
+        int w=frame.getWidth(),h=frame.getHeight();
+        float scale=Math.max(vw/(float)w,vh/(float)h);
+        float visibleW=vw/scale, visibleH=vh/scale;
+        float offsetX=(w-visibleW)/2f,offsetY=(h-visibleH)/2f;
+        float rw=vw*widthFrac,rh=vh*heightFrac;
+        float leftInView=(vw-rw)/2f;
+        float topInView=Math.max(0,Math.min(vh-rh,vh*centerYFrac-rh/2f));
+        int left=Math.max(0,Math.min(w-1,Math.round(offsetX+leftInView/scale)));
+        int top=Math.max(0,Math.min(h-1,Math.round(offsetY+topInView/scale)));
+        int cropW=Math.min(w-left,Math.max(20,Math.round(rw/scale)));
+        int cropH=Math.min(h-top,Math.max(20,Math.round(rh/scale)));
+        return Bitmap.createBitmap(frame,left,top,cropW,cropH);
+    }
+    private void recognizeFrame(Bitmap crop){
+        // First use the real high-resolution image: thresholding can destroy thin letters.
+        recognizer.process(InputImage.fromBitmap(crop,0))
+            .addOnSuccessListener(result -> {
+                SubtitleData data=extractSubtitle(result);
+                if(!data.speech.isEmpty() || contrastMode==0) {
+                    if(data.speech.isEmpty()) recognized.setText("OCR: текст в рамке не найден");
+                    onRecognition(data);crop.recycle();busy=false;
+                }else recognizeEnhanced(crop);
+            })
+            .addOnFailureListener(e->{ show("Ошибка OCR: "+e.getMessage());crop.recycle();busy=false; });
+    }
+    private void recognizeEnhanced(Bitmap crop){
+        final Bitmap enhanced;
+        try{enhanced=enhanceSubtitleText(crop,contrastMode==1);}
+        catch(Exception e){crop.recycle();busy=false;show("Ошибка контраста: "+e.getMessage());return;}
+        recognizer.process(InputImage.fromBitmap(enhanced,0))
+            .addOnSuccessListener(result->onRecognition(extractSubtitle(result)))
+            .addOnFailureListener(e->show("Ошибка OCR: "+e.getMessage()))
+            .addOnCompleteListener(task->{enhanced.recycle();crop.recycle();busy=false;});
     }
     /** Preserve OCR line boundaries: a speaker label need not contain a colon. */
     private static class SubtitleData {
@@ -410,12 +450,12 @@ public class MainActivity extends AppCompatActivity {
         String speaker = !data.speaker.isEmpty() ? data.speaker :
             System.currentTimeMillis()<activeSpeakerUntil ? activeSpeaker : null;
         if(cleaned.equalsIgnoreCase(candidate)) attempts++; else{candidate=cleaned;attempts=1;}
-        if(attempts<2)return;
+        if(attempts<1)return;
         if(cleaned.equalsIgnoreCase(lastSpoken))return;
         if(System.currentTimeMillis()-lastSpokenAt<350)return;
         lastSpoken=cleaned;lastSpokenAt=System.currentTimeMillis();
         final boolean male=speaker==null?defaultKind==0:Boolean.TRUE.equals(characterGender.get(speaker));
-        recognized.setText("Реплика: "+cleaned+(speaker==null?"":"  ["+speaker+"]"));
+        recognized.setText("OCR: "+cleaned+(speaker==null?"":"  ["+speaker+"]"));
         if(translateSwitch.isChecked()){
             if(!translatorReady){show("Ожидаю загрузку модели перевода…");return;}
             final String fingerprint=cleaned;
@@ -444,5 +484,5 @@ public class MainActivity extends AppCompatActivity {
         }
     }
     @Override protected void onDestroy(){handler.removeCallbacksAndMessages(null);started=false;
-        recognizer.close();if(translator!=null)translator.close();if(tts!=null){tts.stop();tts.shutdown();}super.onDestroy();}
+        recognizer.close();cameraExecutor.shutdown();if(translator!=null)translator.close();if(tts!=null){tts.stop();tts.shutdown();}super.onDestroy();}
 }
