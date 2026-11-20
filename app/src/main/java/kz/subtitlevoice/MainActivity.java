@@ -65,6 +65,7 @@ import com.google.mlkit.nl.translate.Translation;
 
 import java.util.*;
 import org.json.JSONObject;
+import org.json.JSONArray;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.io.InputStream;
