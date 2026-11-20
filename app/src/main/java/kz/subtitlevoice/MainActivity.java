@@ -16,6 +16,12 @@ import java.util.concurrent.Executors;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.speech.RecognizerIntent;
+import android.speech.RecognitionListener;
+import android.speech.SpeechRecognizer;
+import android.content.Intent;
+import android.os.Build;
+import android.speech.tts.UtteranceProgressListener;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.Voice;
 import android.view.Gravity;
@@ -57,6 +63,21 @@ public class MainActivity extends AppCompatActivity {
     private final Map<String, Boolean> characterGender = new LinkedHashMap<>();
     private final ArrayList<Voice> russianVoices = new ArrayList<>();
     private SharedPreferences prefs;
+    private boolean audioMode = false, microphoneActive = false, audioPending = false, audioTtsPlaying = false;
+    private SpeechRecognizer speechRecognizer;
+    private LinearLayout cameraPanel, audioPanel;
+    private TextView audioStatus, audioTranscript;
+    private Spinner modeSpinner, audioGenderSpinner;
+    // Estimate pitch only when the installed Android recognizer provides PCM buffers.
+    private int pitchMaleVotes = 0, pitchFemaleVotes = 0;
+    private String lastAudioText = "";
+    private long lastAudioAt = 0;
+    private final Runnable retryMicrophone = () -> beginListening();
+    private final ActivityResultLauncher<String> microphonePermission = registerForActivityResult(
+        new ActivityResultContracts.RequestPermission(), granted -> {
+            if (granted && audioMode) startMicrophone();
+            else if (!granted && audioMode) show("Разреши доступ к микрофону");
+        });
     private PreviewView preview;
     private RoiOverlay overlay;
     private TextView status, recognized, speedLabel, namesLabel;
@@ -95,19 +116,27 @@ public class MainActivity extends AppCompatActivity {
         femaleIndex = prefs.getInt("femaleVoice", 0);
         defaultKind = prefs.getInt("defaultKind", 0);
         contrastMode = prefs.getInt("contrastMode", 0);
+        audioMode = prefs.getInt("mode", 0) == 1;
         loadCharacters();
         buildUi();
         tts = new TextToSpeech(this, code -> handler.post(() -> {
             ttsReady = code == TextToSpeech.SUCCESS;
-            if (ttsReady) { tts.setLanguage(new Locale("ru", "RU")); populateVoices(); }
+            if (ttsReady) {
+                tts.setLanguage(new Locale("ru", "RU")); populateVoices();
+                tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                    @Override public void onStart(String id) {}
+                    @Override public void onDone(String id) { handler.post(() -> onAudioSpeechFinished()); }
+                    @Override public void onError(String id) { handler.post(() -> onAudioSpeechFinished()); }
+                });
+            }
             else show("Не найден движок озвучки Android");
         }));
         TranslatorOptions options = new TranslatorOptions.Builder()
             .setSourceLanguage(TranslateLanguage.ENGLISH).setTargetLanguage(TranslateLanguage.RUSSIAN).build();
         translator = Translation.getClient(options);
         if (translateSwitch.isChecked()) prepareTranslator();
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera();
-        else cameraPermission.launch(Manifest.permission.CAMERA);
+        if (audioMode) requestMicrophone();
+        else requestCamera();
     }
 
     private int dp(float value) { return (int)(getResources().getDisplayMetrics().density * value + .5f); }
@@ -118,23 +147,56 @@ public class MainActivity extends AppCompatActivity {
         LinearLayout root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL); root.setBackgroundColor(Color.rgb(13,18,29));
         ScrollView scroll = new ScrollView(this); root.addView(scroll);
         LinearLayout content = new LinearLayout(this); content.setOrientation(LinearLayout.VERTICAL); content.setPadding(dp(12), dp(10), dp(12), dp(18)); scroll.addView(content);
-        add(content, text("SUBTITLE VOICE   •   Камера → голос", 19));
+        add(content, text("SUBTITLE VOICE   •   Перевод и озвучка", 19));
+        add(content, text("Режим работы", 16));
+        modeSpinner = new Spinner(this);
+        modeSpinner.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
+            new String[]{"Озвучка по субтитрам", "Озвучка по аудио"}));
+        modeSpinner.setSelection(audioMode ? 1 : 0);
+        add(content, modeSpinner);
+        cameraPanel = new LinearLayout(this);
+        cameraPanel.setOrientation(LinearLayout.VERTICAL);
+        add(content, cameraPanel);
+        audioPanel = new LinearLayout(this);
+        audioPanel.setOrientation(LinearLayout.VERTICAL);
+        add(content, audioPanel);
+        add(audioPanel, text("Режим микрофона: английская речь с телевизора → перевод на русский → голос", 13));
+        audioStatus = text("Микрофон не запущен", 13); add(audioPanel, audioStatus);
+        audioTranscript = text("Распознано: —", 14); add(audioPanel, audioTranscript);
+        add(audioPanel, text("Пол голоса определяется приблизительно по высоте тона, только если речевой движок предоставляет аудиобуфер. Если данных нет, используется выбор ниже.", 12));
+        audioGenderSpinner = new Spinner(this);
+        audioGenderSpinner.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
+            new String[]{"Авто (экспериментально)", "Всегда мужской", "Всегда женский"}));
+        audioGenderSpinner.setSelection(prefs.getInt("audioGenderMode", 0));
+        add(audioPanel, audioGenderSpinner);
+        audioGenderSpinner.setOnItemSelectedListener(new SpinnerListener(i ->
+            prefs.edit().putInt("audioGenderMode", i).apply()));
+        Button audioToggle = new Button(this);
+        audioToggle.setText("Остановить / запустить прослушивание");
+        add(audioPanel, audioToggle);
+        audioToggle.setOnClickListener(v -> {
+            if (microphoneActive) stopMicrophone(); else requestMicrophone();
+        });
+        add(audioPanel, text("Чтобы микрофон не распознавал синтезированную речь повторно, прослушивание приостанавливается на время озвучки. Лучше пользоваться наушниками.", 12));
+        cameraPanel.setVisibility(audioMode ? View.GONE : View.VISIBLE);
+        audioPanel.setVisibility(audioMode ? View.VISIBLE : View.GONE);
+        modeSpinner.setOnItemSelectedListener(new SpinnerListener(i -> switchMode(i == 1)));
         FrameLayout stage = new FrameLayout(this);
         stage.setBackgroundColor(Color.BLACK);
-        add(content, stage);
+        add(cameraPanel, stage);
         stage.getLayoutParams().height = dp(300);
         preview = new PreviewView(this);
         preview.setScaleType(PreviewView.ScaleType.FILL_CENTER);
         stage.addView(preview, new FrameLayout.LayoutParams(-1,-1));
         overlay = new RoiOverlay(); stage.addView(overlay,new FrameLayout.LayoutParams(-1,-1));
-        add(content, text("Распознаётся ТОЛЬКО область внутри рамки. Наведи камеру на центр нижней части ТВ.", 12));
-        status = text("Инициализация…", 13); add(content,status);
-        recognized = text("Последняя реплика: —", 14); add(content,recognized);
+        add(cameraPanel, text("Распознаётся ТОЛЬКО область внутри рамки. Наведи камеру на центр нижней части ТВ.", 12));
+        status = text("Инициализация…", 13); add(cameraPanel,status);
+        recognized = text("Последняя реплика: —", 14); add(cameraPanel,recognized);
         showOcrPreviewSwitch = new Switch(this);
         showOcrPreviewSwitch.setText("Показывать реальный кадр OCR (для настройки рамки)");
         showOcrPreviewSwitch.setTextColor(Color.WHITE);
         showOcrPreviewSwitch.setChecked(prefs.getBoolean("debugCrop", true));
-        add(content, showOcrPreviewSwitch);
+        add(cameraPanel, showOcrPreviewSwitch);
         showOcrPreviewSwitch.setOnCheckedChangeListener((b, enabled) -> {
             prefs.edit().putBoolean("debugCrop", enabled).apply();
             ocrPreview.setVisibility(enabled ? View.VISIBLE : View.GONE);
@@ -145,13 +207,13 @@ public class MainActivity extends AppCompatActivity {
         ocrPreview.setBackgroundColor(Color.rgb(28, 31, 40));
         ocrPreview.setMaxHeight(dp(130));
         ocrPreview.setVisibility(showOcrPreviewSwitch.isChecked() ? View.VISIBLE : View.GONE);
-        add(content, ocrPreview);
-        add(content, text("Проверка OCR: здесь должны быть видны ВСЕ буквы субтитра, без верхних меню игры.", 12));
-        Button toggle = new Button(this); toggle.setText("Пауза распознавания"); add(content,toggle);
+        add(cameraPanel, ocrPreview);
+        add(cameraPanel, text("Проверка OCR: здесь должны быть видны ВСЕ буквы субтитра, без верхних меню игры.", 12));
+        Button toggle = new Button(this); toggle.setText("Пауза распознавания"); add(cameraPanel,toggle);
         toggle.setOnClickListener(v -> { started = !started; toggle.setText(started ? "Пауза распознавания" : "Продолжить распознавание"); if (!started && tts != null) tts.stop(); });
-        add(content,text("Область субтитров",16));
-        add(content,text("Контраст субтитров на фоне игры",16));
-        add(content,text("Если у субтитров нет чёрной подложки, попробуй режим «Светлые буквы». Он выделяет текст относительно окружающего фона.",12));
+        add(cameraPanel,text("Область субтитров",16));
+        add(cameraPanel,text("Контраст субтитров на фоне игры",16));
+        add(cameraPanel,text("Если у субтитров нет чёрной подложки, попробуй режим «Светлые буквы». Он выделяет текст относительно окружающего фона.",12));
         Spinner contrastSpinner = new Spinner(this);
         contrastSpinner.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
             new String[]{"HD без фильтра (рекомендуется)", "Светлые буквы на пёстром фоне", "Тёмные буквы на пёстром фоне"}));
@@ -159,7 +221,7 @@ public class MainActivity extends AppCompatActivity {
         contrastSpinner.setOnItemSelectedListener(new SpinnerListener(i -> {
             contrastMode=i; prefs.edit().putInt("contrastMode",i).apply();
         }));
-        add(content,contrastSpinner);
+        add(cameraPanel,contrastSpinner);
         addSlider(content,"Ширина рамки",55,100,Math.round(widthFrac*100), value -> {widthFrac=value/100f; saveRoi();});
         addSlider(content,"Высота рамки",7,35,Math.round(heightFrac*100), value -> {heightFrac=value/100f; saveRoi();});
         addSlider(content,"Положение по вертикали",55,95,Math.round(centerYFrac*100), value -> {centerYFrac=value/100f;saveRoi();});
@@ -247,6 +309,177 @@ public class MainActivity extends AppCompatActivity {
           .addOnSuccessListener(v->{translatorReady=true;lastSpoken="";show("Перевод офлайн готов");})
           .addOnFailureListener(e->show("Не удалось скачать модель перевода: "+e.getMessage()));
     }
+    private void requestCamera() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera();
+        else cameraPermission.launch(Manifest.permission.CAMERA);
+    }
+    private void requestMicrophone() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) startMicrophone();
+        else microphonePermission.launch(Manifest.permission.RECORD_AUDIO);
+    }
+    private void switchMode(boolean useAudio) {
+        if (useAudio == audioMode) return;
+        audioMode = useAudio;
+        prefs.edit().putInt("mode", audioMode ? 1 : 0).apply();
+        cameraPanel.setVisibility(audioMode ? View.GONE : View.VISIBLE);
+        audioPanel.setVisibility(audioMode ? View.VISIBLE : View.GONE);
+        if (tts != null) tts.stop();
+        audioTtsPlaying = false;
+        audioPending = false;
+        if (audioMode) {
+            started = false;
+            requestMicrophone();
+        } else {
+            stopMicrophone();
+            requestCamera();
+        }
+    }
+    private void startMicrophone() {
+        if (!audioMode) return;
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            audioStatus.setText("На телефоне нет доступной службы распознавания речи Android");
+            return;
+        }
+        if (speechRecognizer == null) {
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
+            speechRecognizer.setRecognitionListener(new RecognitionListener() {
+                @Override public void onReadyForSpeech(Bundle b) { audioStatus.setText("Слушаю английскую речь…"); }
+                @Override public void onBeginningOfSpeech() { audioStatus.setText("Слышу речь…"); }
+                @Override public void onRmsChanged(float rms) {}
+                @Override public void onBufferReceived(byte[] bytes) { estimateVoicePitch(bytes); }
+                @Override public void onEndOfSpeech() { audioStatus.setText("Распознаю…"); }
+                @Override public void onError(int code) {
+                    if (!microphoneActive || !audioMode) return;
+                    if (code == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                        audioStatus.setText("Нет разрешения на микрофон"); stopMicrophone(); return;
+                    }
+                    audioStatus.setText("Перезапуск прослушивания (" + code + ")…");
+                    if (!audioPending && !audioTtsPlaying) scheduleMicrophone(600);
+                }
+                @Override public void onResults(Bundle results) {
+                    if (!microphoneActive || !audioMode) return;
+                    ArrayList<String> list = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                    String phrase = list == null || list.isEmpty() ? "" : list.get(0).trim();
+                    if (phrase.isEmpty()) { scheduleMicrophone(250); return; }
+                    handleAudioPhrase(phrase);
+                }
+                @Override public void onPartialResults(Bundle results) {
+                    ArrayList<String> list = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                    if (microphoneActive && audioMode && list != null && !list.isEmpty())
+                        audioTranscript.setText("Слышу: " + list.get(0));
+                }
+                @Override public void onEvent(int type, Bundle params) {}
+            });
+        }
+        microphoneActive = true;
+        beginListening();
+    }
+    private void beginListening() {
+        if (!audioMode || !microphoneActive || audioPending || audioTtsPlaying || speechRecognizer == null) return;
+        pitchMaleVotes = 0; pitchFemaleVotes = 0;
+        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US");
+        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 400L);
+        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 300L);
+        try { speechRecognizer.startListening(intent); }
+        catch (Exception e) { audioStatus.setText("Ошибка микрофона: " + e.getMessage()); }
+    }
+    private void scheduleMicrophone(long delay) {
+        handler.removeCallbacks(retryMicrophone);
+        if (microphoneActive && audioMode && !audioPending && !audioTtsPlaying)
+            handler.postDelayed(retryMicrophone, delay);
+    }
+    private void stopMicrophone() {
+        microphoneActive = false;
+        audioPending = false;
+        handler.removeCallbacks(retryMicrophone);
+        if (speechRecognizer != null) speechRecognizer.cancel();
+        if (audioStatus != null) audioStatus.setText("Микрофон остановлен");
+    }
+    /** A conservative approximation, not a biological gender classifier.
+     * Android recognition services may never invoke onBufferReceived; in that case
+     * the fallback voice is used. PCM16 16-kHz data is assumed only for this optional estimate.
+     */
+    private void estimateVoicePitch(byte[] pcm) {
+        if (pcm == null || pcm.length < 1024 || pcm.length > 64000) return;
+        int length = Math.min(pcm.length / 2, 4096);
+        float[] samples = new float[length];
+        double energy = 0;
+        for (int i=0; i<length; i++) {
+            int lo = pcm[2*i] & 0xff;
+            short sample = (short) ((pcm[2*i+1] << 8) | lo);
+            samples[i] = sample / 32768f;
+            energy += samples[i] * samples[i];
+        }
+        if (energy / length < .001) return;
+        // 16-kHz autocorrelation of voiced frames, 85–300 Hz.
+        int minLag = 16000/300, maxLag = Math.min(length/2,16000/85);
+        double best = 0; int peak = 0;
+        for (int lag=minLag; lag<=maxLag; lag+=2) {
+            double correlation=0, power=0;
+            for(int j=0;j<length-lag;j+=3) {
+                correlation += samples[j]*samples[j+lag];
+                power += samples[j]*samples[j];
+            }
+            if(power>0 && correlation/power>best) {best=correlation/power;peak=lag;}
+        }
+        if(best<.62 || peak==0) return;
+        float f0 = 16000f / peak;
+        if (f0 < 155) pitchMaleVotes++;
+        else if(f0 > 190) pitchFemaleVotes++;
+    }
+    private boolean audioMaleVoice() {
+        int selected=audioGenderSpinner.getSelectedItemPosition();
+        if (selected==1) return true;
+        if (selected==2) return false;
+        if (pitchMaleVotes + pitchFemaleVotes < 3 || Math.abs(pitchMaleVotes-pitchFemaleVotes)<2)
+            return defaultKind==0;
+        return pitchMaleVotes>pitchFemaleVotes;
+    }
+    private void handleAudioPhrase(String phrase) {
+        long now = System.currentTimeMillis();
+        audioTranscript.setText("Распознано: " + phrase);
+        if (phrase.equalsIgnoreCase(lastAudioText) && now-lastAudioAt<4000) {
+            scheduleMicrophone(250); return;
+        }
+        lastAudioText=phrase; lastAudioAt=now;
+        final boolean male=audioMaleVoice();
+        audioPending=true;
+        if (!translateSwitch.isChecked()) {
+            speakAudio(phrase,male); return;
+        }
+        if (!translatorReady) {
+            audioStatus.setText("Ожидаю модель перевода. Проверь интернет…");
+            audioPending=false; scheduleMicrophone(700); return;
+        }
+        translator.translate(phrase)
+            .addOnSuccessListener(r -> {
+                if (audioMode && microphoneActive) speakAudio(r,male);
+                else audioPending=false;
+            })
+            .addOnFailureListener(e -> {
+                audioPending=false;
+                audioStatus.setText("Ошибка перевода: " + e.getMessage());
+                scheduleMicrophone(350);
+            });
+    }
+    private void speakAudio(String text, boolean male) {
+        audioPending=false;
+        if (!microphoneActive || !audioMode) return;
+        if (!ttsReady || text.trim().isEmpty()) { scheduleMicrophone(300); return; }
+        audioTtsPlaying=true;
+        audioStatus.setText("Озвучиваю: " + text);
+        speak(text,male);
+    }
+    private void onAudioSpeechFinished() {
+        if (audioTtsPlaying) {
+            audioTtsPlaying=false;
+            scheduleMicrophone(200);
+        }
+    }
     private void startCamera(){
         ListenableFuture<ProcessCameraProvider> future=ProcessCameraProvider.getInstance(this);
         future.addListener(()->{
@@ -259,7 +492,7 @@ public class MainActivity extends AppCompatActivity {
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build();
                 analysis.setAnalyzer(cameraExecutor, frame -> {
-                    if (!started || busy) {frame.close();return;}
+                    if (audioMode || !started || busy) {frame.close();return;}
                     busy=true;
                     try {
                         Bitmap captured=bitmapFromFrame(frame);
@@ -525,6 +758,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void onRecognition(SubtitleData data){
+        if (audioMode) return;
         final long now=System.currentTimeMillis();
         String cleaned=data.speech.replaceAll("\\s+"," ").trim();
         if(!data.speaker.isEmpty()){
@@ -595,6 +829,9 @@ public class MainActivity extends AppCompatActivity {
             canvas.drawRoundRect(new RectF(l,t,l+rw,t+rh),dp(6),dp(6),stroke);
         }
     }
-    @Override protected void onDestroy(){handler.removeCallbacksAndMessages(null);started=false;
+    @Override protected void onDestroy(){
+        stopMicrophone();
+        if (speechRecognizer != null) {speechRecognizer.destroy();speechRecognizer=null;}
+        handler.removeCallbacksAndMessages(null);started=false;
         recognizer.close();cameraExecutor.shutdown();if(translator!=null)translator.close();if(tts!=null){tts.stop();tts.shutdown();}super.onDestroy();}
 }
