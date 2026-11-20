@@ -6,6 +6,7 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.os.Bundle;
 import android.os.Handler;
@@ -58,10 +59,11 @@ public class MainActivity extends AppCompatActivity {
     private boolean translatorReady = false, ttsReady = false, started = false, busy = false;
     private int attempts = 0, framesSinceText = 0;
     private String candidate = "", lastSpoken = "";
+    private String activeSpeaker = null;
+    private long activeSpeakerUntil = 0;
     private long lastSpokenAt = 0;
     private float widthFrac = .82f, heightFrac = .17f, centerYFrac = .80f, speechRate = 1.25f;
-    private int maleIndex = 0, femaleIndex = 0, defaultKind = 0;
-    private final Pattern characterTag = Pattern.compile("^\\s*([\\p{L}][\\p{L} ._'-]{0,30})\\s*[:：]\\s*(.+)$", Pattern.DOTALL);
+    private int maleIndex = 0, femaleIndex = 0, defaultKind = 0, contrastMode = 1;
     private final ActivityResultLauncher<String> cameraPermission = registerForActivityResult(new ActivityResultContracts.RequestPermission(), allowed -> {
         if (allowed) startCamera(); else show("Нужно разрешение камеры");
     });
@@ -76,6 +78,7 @@ public class MainActivity extends AppCompatActivity {
         maleIndex = prefs.getInt("maleVoice", 0);
         femaleIndex = prefs.getInt("femaleVoice", 0);
         defaultKind = prefs.getInt("defaultKind", 0);
+        contrastMode = prefs.getInt("contrastMode", 1);
         loadCharacters();
         buildUi();
         tts = new TextToSpeech(this, code -> handler.post(() -> {
@@ -114,6 +117,16 @@ public class MainActivity extends AppCompatActivity {
         Button toggle = new Button(this); toggle.setText("Пауза распознавания"); add(content,toggle);
         toggle.setOnClickListener(v -> { started = !started; toggle.setText(started ? "Пауза распознавания" : "Продолжить распознавание"); if (!started && tts != null) tts.stop(); });
         add(content,text("Область субтитров",16));
+        add(content,text("Контраст субтитров на фоне игры",16));
+        add(content,text("Если у субтитров нет чёрной подложки, попробуй режим «Светлые буквы». Он выделяет текст относительно окружающего фона.",12));
+        Spinner contrastSpinner = new Spinner(this);
+        contrastSpinner.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
+            new String[]{"Без обработки", "Светлые буквы на пёстром фоне", "Тёмные буквы на пёстром фоне"}));
+        contrastSpinner.setSelection(contrastMode);
+        contrastSpinner.setOnItemSelectedListener(new SpinnerListener(i -> {
+            contrastMode=i; prefs.edit().putInt("contrastMode",i).apply();
+        }));
+        add(content,contrastSpinner);
         addSlider(content,"Ширина рамки",55,100,Math.round(widthFrac*100), value -> {widthFrac=value/100f; saveRoi();});
         addSlider(content,"Высота рамки",7,35,Math.round(heightFrac*100), value -> {heightFrac=value/100f; saveRoi();});
         addSlider(content,"Положение по вертикали",55,95,Math.round(centerYFrac*100), value -> {centerYFrac=value/100f;saveRoi();});
@@ -138,7 +151,8 @@ public class MainActivity extends AppCompatActivity {
         ArrayAdapter<String> defaultAdapter = new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"Мужской","Женский"});
         defaultSpinner.setAdapter(defaultAdapter);defaultSpinner.setSelection(defaultKind);
         defaultSpinner.setOnItemSelectedListener(new SpinnerListener(index -> {defaultKind=index;prefs.edit().putInt("defaultKind",index).apply();}));
-        add(content,text("Привязка голоса по имени (например, Маша: Привет)",16));
+        add(content,text("Привязка голоса по имени: отдельная подпись сверху/слева, имя перед тире или двоеточием",16));
+        add(content,text("Имена отделяются от реплик до перевода и озвучки. Для подписи другим цветом имя нужно добавить в список персонажей; без подписи используется голос по умолчанию.",12));
         namesLabel=text("",13);add(content,namesLabel); renderNames();
         EditText nameInput = new EditText(this);nameInput.setTextColor(Color.WHITE);nameInput.setHintTextColor(0xffaaaaaa);nameInput.setHint("Имя персонажа: Маша");nameInput.setSingleLine(true);add(content,nameInput);
         Spinner gender = new Spinner(this);gender.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,new String[]{"Мужской", "Женский"}));add(content,gender);
@@ -231,44 +245,186 @@ public class MainActivity extends AppCompatActivity {
         } catch(Exception e) {bitmap.recycle();return;}
         bitmap.recycle();
         busy=true;
-        recognizer.process(InputImage.fromBitmap(cropped,0))
-          .addOnSuccessListener(result->{
-              StringBuilder s=new StringBuilder();
-              for(com.google.mlkit.vision.text.Text.TextBlock block:result.getTextBlocks()){
-                  if(s.length()>0)s.append(' ');s.append(block.getText().replace('\n',' '));
+        final Bitmap processed;
+        try {
+            processed = contrastMode == 0 ? cropped : enhanceSubtitleText(cropped, contrastMode == 1);
+        } catch (Exception ex) {
+            cropped.recycle(); busy=false; show("Ошибка обработки кадра: " + ex.getMessage()); return;
+        }
+        recognizer.process(InputImage.fromBitmap(processed,0))
+          .addOnSuccessListener(result -> {
+              SubtitleData data=extractSubtitle(result);
+              if (!data.speech.isEmpty() || !data.speaker.isEmpty() || processed == cropped) {
+                  onRecognition(data);
+                  busy=false;
+                  processed.recycle();
+                  if (processed != cropped) cropped.recycle();
+              } else {
+                  // Only if contrast enhancement fails to find any letters, try the original.
+                  recognizer.process(InputImage.fromBitmap(cropped,0))
+                    .addOnSuccessListener(original -> onRecognition(extractSubtitle(original)))
+                    .addOnFailureListener(e -> show("Ошибка OCR: " + e.getMessage()))
+                    .addOnCompleteListener(t -> {busy=false;processed.recycle();cropped.recycle();});
               }
-              onRecognition(s.toString().trim());
-          }).addOnFailureListener(e->show("Ошибка OCR: "+e.getMessage()))
-          .addOnCompleteListener(task->{busy=false;cropped.recycle();});
+          })
+          .addOnFailureListener(e -> {
+              show("Ошибка OCR: " + e.getMessage());
+              busy=false; processed.recycle(); if(processed != cropped) cropped.recycle();
+          });
     }
-    private void onRecognition(String raw){
-        String cleaned=raw.replaceAll("\\s+"," ").trim();
+    /** Preserve OCR line boundaries: a speaker label need not contain a colon. */
+    private static class SubtitleData {
+        final String speech, speaker;
+        SubtitleData(String speech, String speaker) {
+            this.speech=speech.trim(); this.speaker=speaker == null ? "" : speaker;
+        }
+    }
+    private static class OcrLine {
+        String value;
+        final Rect rect;
+        final com.google.mlkit.vision.text.Text.Line source;
+        OcrLine(com.google.mlkit.vision.text.Text.Line line) {
+            this.source=line; this.value=line.getText().trim(); this.rect=line.getBoundingBox();
+        }
+    }
+    private String normalizedLabel(String s) {
+        return s.toLowerCase(Locale.ROOT)
+            .replaceAll("^[\\s\\[({\\-–—]+", "")
+            .replaceAll("[\\s\\])}:：\\-–—]+$", "").trim();
+    }
+    private boolean isName(String s) { return characterGender.containsKey(normalizedLabel(s)); }
+    private String joinWords(List<OcrLine> lines) {
+        StringBuilder b=new StringBuilder();
+        for(OcrLine line:lines){ if(!line.value.isEmpty()) {if(b.length()>0)b.append(' '); b.append(line.value);} }
+        return b.toString();
+    }
+    private SubtitleData extractSubtitle(com.google.mlkit.vision.text.Text result) {
+        List<OcrLine> lines=new ArrayList<>();
+        for(com.google.mlkit.vision.text.Text.TextBlock block:result.getTextBlocks())
+            for(com.google.mlkit.vision.text.Text.Line line:block.getLines())
+                if (!line.getText().trim().isEmpty()) lines.add(new OcrLine(line));
+        // Normally subtitle labels are above their speech or at its left edge.
+        lines.sort((a,b) -> {
+            if(a.rect==null || b.rect==null)return 0;
+            int h=Math.max(8,Math.min(a.rect.height(),b.rect.height()));
+            if(Math.abs(a.rect.centerY()-b.rect.centerY()) < h*.55f)
+                return Integer.compare(a.rect.left,b.rect.left);
+            return Integer.compare(a.rect.top,b.rect.top);
+        });
+        String speaker="";
+        List<OcrLine> payload=new ArrayList<>();
+        for(int i=0;i<lines.size();i++) {
+            OcrLine line=lines.get(i);
+            String lineText=line.value;
+            String solo=normalizedLabel(lineText);
+            // Standalone label, including [Masha], (Masha), Masha —.
+            if(isName(solo) && (lines.size()>1 || i==0)) { speaker=solo; continue; }
+            // Explicitly separated label: Masha: speech; Masha — speech; [Masha] speech.
+            boolean handled=false;
+            for(String name:characterGender.keySet()) {
+                String quoted=Pattern.quote(name);
+                Pattern explicit=Pattern.compile("(?iu)^\\s*(?:\\[|\\()?"+quoted+"(?:\\]|\\))?\\s*[:：—–-]\\s*(.+)$");
+                Matcher match=explicit.matcher(lineText);
+                if(match.matches()) {
+                    speaker=name;
+                    String rest=match.group(1).trim();
+                    if(!rest.isEmpty())payload.add(new OcrLineAdapter(rest,line));
+                    handled=true;break;
+                }
+                // No punctuation: require OCR to see the name as a separate element
+                // with a visibly larger-than-normal gap before the first spoken word.
+                List<? extends com.google.mlkit.vision.text.Text.Element> els=line.source.getElements();
+                if(els.size()>1 && normalizedLabel(els.get(0).getText()).equals(name)) {
+                    Rect first=els.get(0).getBoundingBox(), second=els.get(1).getBoundingBox();
+                    if(first!=null && second!=null &&
+                       second.left-first.right > Math.max(8,first.height()*.6f)) {
+                        speaker=name;
+                        String rest=lineText.substring(Math.min(lineText.length(),els.get(0).getText().length())).trim();
+                        if(!rest.isEmpty())payload.add(new OcrLineAdapter(rest,line));
+                        handled=true;break;
+                    }
+                }
+            }
+            if(!handled)payload.add(line);
+        }
+        return new SubtitleData(joinWords(payload),speaker);
+    }
+    private static class OcrLineAdapter extends OcrLine {
+        OcrLineAdapter(String text,OcrLine original) {super(original.source);value=text;}
+    }
+
+    /** Local adaptive threshold: separates bright/dark letter strokes from changing game scenery.
+     *  The integral image makes local background estimation linear in pixel count.
+     */
+    private Bitmap enhanceSubtitleText(Bitmap source, boolean lightLetters) {
+        int w=source.getWidth(), h=source.getHeight();
+        int[] pixels=new int[w*h];
+        source.getPixels(pixels,0,w,0,0,w,h);
+        int[] gray=new int[w*h];
+        long[] sum=new long[(w+1)*(h+1)];
+        for(int y=0; y<h; y++) {
+            long rowSum=0;
+            for(int x=0; x<w; x++) {
+                int c=pixels[y*w+x];
+                int lum=(Color.red(c)*77 + Color.green(c)*150 + Color.blue(c)*29)>>8;
+                gray[y*w+x]=lum;
+                rowSum+=lum;
+                sum[(y+1)*(w+1)+x+1]=sum[y*(w+1)+x+1]+rowSum;
+            }
+        }
+        int[] output=new int[w*h];
+        int radius=Math.max(6,Math.min(22,w/55));
+        int contrast=18;
+        for(int y=0;y<h;y++){
+            int y0=Math.max(0,y-radius),y1=Math.min(h-1,y+radius);
+            for(int x=0;x<w;x++){
+                int x0=Math.max(0,x-radius),x1=Math.min(w-1,x+radius);
+                long local=sum[(y1+1)*(w+1)+x1+1]-sum[y0*(w+1)+x1+1]
+                          -sum[(y1+1)*(w+1)+x0]+sum[y0*(w+1)+x0];
+                int mean=(int)(local/((x1-x0+1)*(y1-y0+1)));
+                int lum=gray[y*w+x];
+                // Dark glyphs on white are the preferred polarity for Latin OCR.
+                boolean isGlyph=lightLetters ? lum>mean+contrast : lum<mean-contrast;
+                output[y*w+x]=isGlyph?Color.BLACK:Color.WHITE;
+            }
+        }
+        Bitmap bin=Bitmap.createBitmap(w,h,Bitmap.Config.ARGB_8888);
+        bin.setPixels(output,0,w,0,0,w,h);
+        // Upscale small captions so OCR gets wider glyph strokes.
+        if (w<1100) {
+            Bitmap scaled=Bitmap.createScaledBitmap(bin,w*2,h*2,false);
+            bin.recycle();
+            return scaled;
+        }
+        return bin;
+    }
+
+    private void onRecognition(SubtitleData data){
+        String cleaned=data.speech.replaceAll("\\s+"," ").trim();
+        if(!data.speaker.isEmpty()){
+            activeSpeaker=data.speaker;
+            activeSpeakerUntil=System.currentTimeMillis()+2500;
+        }
         if(cleaned.length()<2){framesSinceText++;if(framesSinceText>=3){candidate="";lastSpoken="";}return;}
         framesSinceText=0;
+        String speaker = !data.speaker.isEmpty() ? data.speaker :
+            System.currentTimeMillis()<activeSpeakerUntil ? activeSpeaker : null;
         if(cleaned.equalsIgnoreCase(candidate)) attempts++; else{candidate=cleaned;attempts=1;}
-        if(attempts<2)return; // Two matching consecutive frames suppress visual noise.
+        if(attempts<2)return;
         if(cleaned.equalsIgnoreCase(lastSpoken))return;
         if(System.currentTimeMillis()-lastSpokenAt<350)return;
         lastSpoken=cleaned;lastSpokenAt=System.currentTimeMillis();
-        String speaker=null;String payload=cleaned;
-        Matcher m=characterTag.matcher(cleaned);
-        if(m.matches()){
-            String key=m.group(1).trim().toLowerCase(Locale.ROOT);
-            if(characterGender.containsKey(key)){speaker=key;payload=m.group(2).trim();}
-        }
-        if(payload.isEmpty())return;
         final boolean male=speaker==null?defaultKind==0:Boolean.TRUE.equals(characterGender.get(speaker));
-        final String sourceText=payload;
-        recognized.setText("Распознано: "+cleaned);
+        recognized.setText("Реплика: "+cleaned+(speaker==null?"":"  ["+speaker+"]"));
         if(translateSwitch.isChecked()){
             if(!translatorReady){show("Ожидаю загрузку модели перевода…");return;}
             final String fingerprint=cleaned;
-            translator.translate(sourceText).addOnSuccessListener(translated->{
+            translator.translate(cleaned).addOnSuccessListener(translated->{
                 if(fingerprint.equals(lastSpoken)){
                     recognized.setText("Озвучка: "+translated);speak(translated,male);
                 }
             }).addOnFailureListener(e->{show("Ошибка перевода: "+e.getMessage());});
-        } else speak(sourceText,male);
+        } else speak(cleaned,male);
     }
     private void speak(String phrase, boolean male){
         if(!ttsReady||phrase.trim().isEmpty())return;
