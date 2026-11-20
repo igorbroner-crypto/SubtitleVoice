@@ -64,6 +64,10 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.io.OutputStream;
 import java.io.InputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import com.googlecode.tesseract.android.TessBaseAPI;
 import java.nio.charset.StandardCharsets;
 import android.text.InputType;
 import java.util.regex.*;
@@ -72,7 +76,12 @@ import java.util.regex.*;
 public class MainActivity extends AppCompatActivity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ExecutorService cameraExecutor = Executors.newSingleThreadExecutor();
+    // English captions: fast Latin ML Kit. Russian captions: offline Tesseract with bundled rus.traineddata.
     private final TextRecognizer recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
+    private final ExecutorService russianOcrExecutor = Executors.newSingleThreadExecutor();
+    private TessBaseAPI russianOcr;
+    private volatile boolean russianOcrUnavailable = false;
+    private long ocrModeGeneration = 0;
     private final Map<String, Boolean> characterGender = new LinkedHashMap<>();
     private final ArrayList<Voice> russianVoices = new ArrayList<>();
     private SharedPreferences prefs;
@@ -131,7 +140,8 @@ public class MainActivity extends AppCompatActivity {
     private Switch translateSwitch;
     private TextToSpeech tts;
     private Translator translator;
-    private boolean translatorReady = false, ttsReady = false, started = false, busy = false;
+    private boolean translatorReady = false, ttsReady = false, started = false;
+    private volatile boolean busy = false;
     private int attempts = 0, framesSinceText = 0;
     private String candidate = "", lastSpoken = "";
     private String candidateSpeaker = "";
@@ -331,8 +341,20 @@ public class MainActivity extends AppCompatActivity {
         translateSwitch.setText("Переводить на русский");translateSwitch.setTextColor(Color.WHITE);
         translateSwitch.setChecked(prefs.getBoolean("translate",true));add(common,translateSwitch);
         translateSwitch.setOnCheckedChangeListener((button,on)->{
-            prefs.edit().putBoolean("translate",on).apply();translationGeneration++;
-            if(on)prepareTranslator();
+            prefs.edit().putBoolean("translate",on).apply();
+            translationGeneration++;
+            ocrModeGeneration++;
+            lastSpoken=""; candidate=""; attempts=0; framesSinceText=0;
+            subtitleCleared=true; recentSpeech.clear();
+            if(tts!=null) tts.stop();
+            if(on) prepareTranslator();
+            if(recognized!=null) recognized.setText(on
+                ? "OCR: английский → перевод на русский"
+                : "OCR: русский → сразу озвучить (без перевода)");
+            if(audioMode && microphoneActive){
+                stopMicrophone();
+                startMicrophone();
+            }
         });
         add(common,text("ВКЛ — переводить распознанный текст на русский. ВЫКЛ — озвучивать распознанный текст без перевода. Автоматического определения языка нет.",13));
         speedLabel=text("Скорость речи: "+String.format(Locale.US,"%.2f×",speechRate),16);add(common,speedLabel);
@@ -891,7 +913,8 @@ public class MainActivity extends AppCompatActivity {
         pitchMaleVotes = 0; pitchFemaleVotes = 0;
         Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
         intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US");
+        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, translateSwitch.isChecked()?"en-US":"ru-RU");
+        intent.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true);
         intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
         intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
         intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 400L);
@@ -1053,6 +1076,125 @@ public class MainActivity extends AppCompatActivity {
         int cropH=Math.min(h-top,Math.max(20,Math.round(rh/scale)));
         return Bitmap.createBitmap(frame,left,top,cropW,cropH);
     }
+    /** Bundled Russian model is copied to app-private storage ONCE; no network use on the phone. */
+    private void ensureRussianOcr() throws IOException {
+        if (russianOcr != null) return;
+        File base = new File(getFilesDir(), "subtitlevoice_ocr");
+        File tessdata = new File(base, "tessdata");
+        if (!tessdata.exists() && !tessdata.mkdirs())
+            throw new IOException("Не удалось создать папку русской OCR-модели");
+        File model = new File(tessdata, "rus.traineddata");
+        if (!model.isFile() || model.length() < 1000000) {
+            // Intentionally no download here: the model must be included in APK at build time.
+            try (InputStream input = getAssets().open("tessdata/rus.traineddata");
+                 FileOutputStream output = new FileOutputStream(model)) {
+                byte[] buf = new byte[32768];
+                int count;
+                while ((count=input.read(buf)) != -1) output.write(buf,0,count);
+            }
+        }
+        if (model.length() < 1000000) throw new IOException("Неполный файл rus.traineddata");
+        TessBaseAPI engine = new TessBaseAPI();
+        if (!engine.init(base.getAbsolutePath(), "rus", TessBaseAPI.OEM_LSTM_ONLY)) {
+            engine.recycle();
+            throw new IOException("Tesseract не запустил русскую модель");
+        }
+        engine.setPageSegMode(TessBaseAPI.PageSegMode.PSM_SINGLE_BLOCK);
+        russianOcr=engine;
+    }
+
+    /** Russian text with optional line above / prefix containing the speaker name. */
+    private SubtitleData extractRussianSubtitle(String raw){
+        if(raw==null || raw.trim().isEmpty()) return new SubtitleData("", "");
+        String speaker="";
+        ArrayList<String> captions=new ArrayList<>();
+        String[] lines=raw.replace('\r','\n').split("\n");
+        Pattern label=Pattern.compile("(?iu)^([\\p{L}][\\p{L}\\p{M}’'\\-]{1,28})\\s*[:：—–-]\\s*(.+)$");
+        for(String line:lines){
+            String v=line.replaceAll("\\s+", " ").trim();
+            if(v.isEmpty())continue;
+            Matcher m=label.matcher(v);
+            if(m.matches()){
+                // Speakers are never read aloud; unknown names use the default male voice.
+                speaker=resolveProfileSpeaker(m.group(1));
+                v=m.group(2).trim();
+            } else if(lines.length>1 && (v.endsWith(":") || v.endsWith("："))){
+                String potential=v.substring(0,v.length()-1).trim();
+                if(potential.matches("[\\p{L}\\p{M}’'\\-]{2,28}")) {
+                    speaker=resolveProfileSpeaker(potential);
+                    continue;
+                }
+            } else if(lines.length>1 && (isName(normalizedLabel(v)) || isRussianProfileName(v))){
+                speaker=resolveProfileSpeaker(v);
+                continue;
+            }
+            if(!v.isEmpty()) captions.add(v);
+        }
+        return new SubtitleData(String.join(" ",captions),speaker);
+    }
+
+    private boolean isRussianProfileName(String candidate) {
+        LinkedHashMap<String,CharacterInfo> characters=profiles.get(activeGame);
+        if(characters==null)return false;
+        for(CharacterInfo character:characters.values())
+            if(normalizedLabel(character.ru).equals(normalizedLabel(candidate))) return true;
+        return false;
+    }
+
+    private String resolveProfileSpeaker(String name) {
+        String normalized=normalizedLabel(name);
+        LinkedHashMap<String,CharacterInfo> characters=profiles.get(activeGame);
+        if(characters!=null) for(Map.Entry<String,CharacterInfo> character: characters.entrySet()) {
+            if(normalizedLabel(character.getKey()).equals(normalized)
+                || normalizedLabel(character.getValue().ru).equals(normalized))
+                return normalizedLabel(character.getKey());
+        }
+        return normalized;
+    }
+
+    /** Never route Cyrillic captions to ML Kit's Latin OCR. Keep Tesseract off the UI thread. */
+    private void recognizeRussianFrame(Bitmap crop, long modeGeneration) {
+        final int filter = contrastMode;
+        russianOcrExecutor.execute(() -> {
+            Bitmap prepared = null;
+            try {
+                ensureRussianOcr();
+                // Upscale only short crops; scaling every full-size frame would add latency.
+                prepared = filter == 0 ? crop : enhanceSubtitleText(crop,filter==1);
+                if(prepared.getHeight()<135){
+                    Bitmap enlarged=Bitmap.createScaledBitmap(prepared,
+                        Math.round(prepared.getWidth()*1.5f),
+                        Math.round(prepared.getHeight()*1.5f),true);
+                    if(enlarged!=prepared){
+                        if(prepared!=crop)prepared.recycle();
+                        prepared=enlarged;
+                    }
+                }
+                russianOcr.setImage(prepared);
+                String text=russianOcr.getUTF8Text();
+                handler.post(() -> {
+                    if(!isFinishing() && !isDestroyed() && !audioMode &&
+                        !translateSwitch.isChecked() && ocrModeGeneration==modeGeneration) {
+                        SubtitleData data=extractRussianSubtitle(text);
+                        if(data.speech.isEmpty())recognized.setText("OCR RU: текст в рамке не найден");
+                        onRecognition(data); // translateOrRead() will return the original text.
+                    }
+                    busy=false;
+                });
+            } catch(Throwable error) {
+                String message=error.getMessage()==null?error.getClass().getSimpleName():error.getMessage();
+                handler.post(() -> {
+                    if(!isFinishing() && !isDestroyed())
+                        recognized.setText("Ошибка русского OCR: "+message);
+                    busy=false;
+                });
+            } finally {
+                if(prepared!=null && prepared!=crop)prepared.recycle();
+                crop.recycle();
+            }
+        });
+    }
+
     private void recognizeFrame(Bitmap crop){
         // Show the EXACT cropped bitmap passed to the OCR engine, not the camera preview.
         if (showOcrPreviewSwitch != null && showOcrPreviewSwitch.isChecked()) {
@@ -1063,6 +1205,12 @@ public class MainActivity extends AppCompatActivity {
             // createScaledBitmap can return the original object when dimensions match.
             if (diagnostic == crop) diagnostic = crop.copy(Bitmap.Config.ARGB_8888, false);
             ocrPreview.setImageBitmap(diagnostic);
+        }
+        // THE LANGUAGE SWITCH IS THE ONLY INPUT-LANGUAGE SELECTOR:
+        // OFF => Russian OCR, no translation. ON => English OCR + Russian translation.
+        if(!translateSwitch.isChecked()) {
+            recognizeRussianFrame(crop, ocrModeGeneration);
+            return;
         }
         // First use the real high-resolution image: thresholding can destroy thin letters.
         recognizer.process(InputImage.fromBitmap(crop,0))
@@ -1346,6 +1494,8 @@ public class MainActivity extends AppCompatActivity {
         if (speechRecognizer != null) {speechRecognizer.destroy();speechRecognizer=null;}
         handler.removeCallbacksAndMessages(null);started=false;
         recognizer.close();cameraExecutor.shutdown();if(translator!=null)translator.close();
+        russianOcrExecutor.execute(() -> {if(russianOcr!=null){russianOcr.recycle();russianOcr=null;}});
+        russianOcrExecutor.shutdown();
         ++ttsInitGeneration;
         if(tts!=null){tts.stop();tts.shutdown();tts=null;}
         super.onDestroy();}
