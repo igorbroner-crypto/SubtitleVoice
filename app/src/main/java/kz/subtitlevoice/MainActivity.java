@@ -60,6 +60,8 @@ public class MainActivity extends AppCompatActivity {
     private PreviewView preview;
     private RoiOverlay overlay;
     private TextView status, recognized, speedLabel, namesLabel;
+    private ImageView ocrPreview;
+    private Switch showOcrPreviewSwitch;
     private Spinner maleSpinner, femaleSpinner, defaultSpinner;
     private Switch translateSwitch;
     private TextToSpeech tts;
@@ -67,11 +69,17 @@ public class MainActivity extends AppCompatActivity {
     private boolean translatorReady = false, ttsReady = false, started = false, busy = false;
     private int attempts = 0, framesSinceText = 0;
     private String candidate = "", lastSpoken = "";
+    private String candidateSpeaker = "";
+    private long candidateStartedAt = 0;
+    private long lastTextSeenAt = 0;
+    private boolean subtitleCleared = true;
+    private final Deque<SpokenRecord> recentSpeech = new ArrayDeque<>();
     private String activeSpeaker = null;
     private long activeSpeakerUntil = 0;
     private long lastSpokenAt = 0;
     private float widthFrac = .82f, heightFrac = .17f, centerYFrac = .80f, speechRate = 1.25f;
     private int maleIndex = 0, femaleIndex = 0, defaultKind = 0, contrastMode = 0;
+    private static final float SAME_TEXT_THRESHOLD = .12f;
     private final ActivityResultLauncher<String> cameraPermission = registerForActivityResult(new ActivityResultContracts.RequestPermission(), allowed -> {
         if (allowed) startCamera(); else show("Нужно разрешение камеры");
     });
@@ -122,6 +130,23 @@ public class MainActivity extends AppCompatActivity {
         add(content, text("Распознаётся ТОЛЬКО область внутри рамки. Наведи камеру на центр нижней части ТВ.", 12));
         status = text("Инициализация…", 13); add(content,status);
         recognized = text("Последняя реплика: —", 14); add(content,recognized);
+        showOcrPreviewSwitch = new Switch(this);
+        showOcrPreviewSwitch.setText("Показывать реальный кадр OCR (для настройки рамки)");
+        showOcrPreviewSwitch.setTextColor(Color.WHITE);
+        showOcrPreviewSwitch.setChecked(prefs.getBoolean("debugCrop", true));
+        add(content, showOcrPreviewSwitch);
+        showOcrPreviewSwitch.setOnCheckedChangeListener((b, enabled) -> {
+            prefs.edit().putBoolean("debugCrop", enabled).apply();
+            ocrPreview.setVisibility(enabled ? View.VISIBLE : View.GONE);
+        });
+        ocrPreview = new ImageView(this);
+        ocrPreview.setAdjustViewBounds(true);
+        ocrPreview.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        ocrPreview.setBackgroundColor(Color.rgb(28, 31, 40));
+        ocrPreview.setMaxHeight(dp(130));
+        ocrPreview.setVisibility(showOcrPreviewSwitch.isChecked() ? View.VISIBLE : View.GONE);
+        add(content, ocrPreview);
+        add(content, text("Проверка OCR: здесь должны быть видны ВСЕ буквы субтитра, без верхних меню игры.", 12));
         Button toggle = new Button(this); toggle.setText("Пауза распознавания"); add(content,toggle);
         toggle.setOnClickListener(v -> { started = !started; toggle.setText(started ? "Пауза распознавания" : "Продолжить распознавание"); if (!started && tts != null) tts.stop(); });
         add(content,text("Область субтитров",16));
@@ -292,6 +317,16 @@ public class MainActivity extends AppCompatActivity {
         return Bitmap.createBitmap(frame,left,top,cropW,cropH);
     }
     private void recognizeFrame(Bitmap crop){
+        // Show the EXACT cropped bitmap passed to the OCR engine, not the camera preview.
+        if (showOcrPreviewSwitch != null && showOcrPreviewSwitch.isChecked()) {
+            float shrink = Math.min(1f, 800f / crop.getWidth());
+            Bitmap diagnostic = Bitmap.createScaledBitmap(crop,
+                Math.max(1, Math.round(crop.getWidth() * shrink)),
+                Math.max(1, Math.round(crop.getHeight() * shrink)), true);
+            // createScaledBitmap can return the original object when dimensions match.
+            if (diagnostic == crop) diagnostic = crop.copy(Bitmap.Config.ARGB_8888, false);
+            ocrPreview.setImageBitmap(diagnostic);
+        }
         // First use the real high-resolution image: thresholding can destroy thin letters.
         recognizer.process(InputImage.fromBitmap(crop,0))
             .addOnSuccessListener(result -> {
@@ -439,31 +474,108 @@ public class MainActivity extends AppCompatActivity {
         return bin;
     }
 
+    /** A stable normalized representation of OCR results; punctuation and spacing are noisy. */
+    private static String normalizeSpeech(String s) {
+        return s.toLowerCase(Locale.ROOT)
+            .replaceAll("[^\\p{L}\\p{N}]+", " ")
+            .replaceAll("\\s+", " ").trim();
+    }
+
+    private static int editDistance(String a, String b) {
+        int[] prev = new int[b.length()+1], next = new int[b.length()+1];
+        for (int j=0; j<=b.length(); j++) prev[j]=j;
+        for (int i=1; i<=a.length(); i++) {
+            next[0]=i;
+            for (int j=1; j<=b.length(); j++) {
+                int cost=a.charAt(i-1)==b.charAt(j-1) ? 0 : 1;
+                next[j]=Math.min(Math.min(next[j-1]+1, prev[j]+1),prev[j-1]+cost);
+            }
+            int[] tmp=prev;prev=next;next=tmp;
+        }
+        return prev[b.length()];
+    }
+
+    /** Suppress camera jitter and normal OCR variation, but not genuinely different lines. */
+    private static boolean sameSubtitle(String first, String second) {
+        String a=normalizeSpeech(first), b=normalizeSpeech(second);
+        if(a.equals(b)) return true;
+        if(a.isEmpty()||b.isEmpty()) return false;
+        int max=Math.max(a.length(),b.length());
+        int min=Math.min(a.length(),b.length());
+        if(min < max * .80f) return false;
+        int distance=editDistance(a,b);
+        return distance<=2 || distance/(float)max <= SAME_TEXT_THRESHOLD;
+    }
+
+    private static class SpokenRecord {
+        final String value;
+        final long at;
+        SpokenRecord(String value, long at){this.value=value;this.at=at;}
+    }
+
+    private boolean recentlyRead(String text, long now) {
+        while(!recentSpeech.isEmpty() && now-recentSpeech.peekFirst().at>12000)
+            recentSpeech.removeFirst();
+        // A continuous subtitle should never replay just because OCR flickers.
+        if(!subtitleCleared && sameSubtitle(text,lastSpoken))return true;
+        // Brief disappearances caused by motion/defocus should not replay a line.
+        for(SpokenRecord record:recentSpeech)
+            if(now-record.at<3500 && sameSubtitle(text,record.value)) return true;
+        return false;
+    }
+
     private void onRecognition(SubtitleData data){
+        final long now=System.currentTimeMillis();
         String cleaned=data.speech.replaceAll("\\s+"," ").trim();
         if(!data.speaker.isEmpty()){
             activeSpeaker=data.speaker;
-            activeSpeakerUntil=System.currentTimeMillis()+2500;
+            activeSpeakerUntil=now+2500;
         }
-        if(cleaned.length()<2){framesSinceText++;if(framesSinceText>=3){candidate="";lastSpoken="";}return;}
+        if(cleaned.length()<2){
+            framesSinceText++;
+            candidate="";attempts=0;
+            // Do not clear the last spoken line after only a couple bad OCR frames.
+            if(framesSinceText>=5 && now-lastTextSeenAt>700) subtitleCleared=true;
+            if(framesSinceText==1)recognized.setText("OCR: субтитры не найдены (ожидание)");
+            return;
+        }
+        lastTextSeenAt=now;
         framesSinceText=0;
-        String speaker = !data.speaker.isEmpty() ? data.speaker :
-            System.currentTimeMillis()<activeSpeakerUntil ? activeSpeaker : null;
-        if(cleaned.equalsIgnoreCase(candidate)) attempts++; else{candidate=cleaned;attempts=1;}
-        if(attempts<1)return;
-        if(cleaned.equalsIgnoreCase(lastSpoken))return;
-        if(System.currentTimeMillis()-lastSpokenAt<350)return;
-        lastSpoken=cleaned;lastSpokenAt=System.currentTimeMillis();
-        final boolean male=speaker==null?defaultKind==0:Boolean.TRUE.equals(characterGender.get(speaker));
+        String speaker=!data.speaker.isEmpty()?data.speaker:
+            now<activeSpeakerUntil?activeSpeaker:null;
         recognized.setText("OCR: "+cleaned+(speaker==null?"":"  ["+speaker+"]"));
+        if(recentlyRead(cleaned,now)){
+            candidate="";attempts=0;
+            return;
+        }
+        if(!candidate.isEmpty() && sameSubtitle(candidate,cleaned)){
+            attempts++;
+        } else {
+            candidate=cleaned;
+            candidateSpeaker=speaker==null?"":speaker;
+            attempts=1;
+            candidateStartedAt=now;
+        }
+        // Confirm a significant change on 2 frames; avoids one-frame OCR hallucinations.
+        // If frames are slow, accept after 300 ms to avoid waiting excessively.
+        if(attempts<2 && now-candidateStartedAt<300) return;
+        if(now-lastSpokenAt<300)return;
+        lastSpoken=cleaned;
+        lastSpokenAt=now;
+        subtitleCleared=false;
+        recentSpeech.addLast(new SpokenRecord(cleaned,now));
+        while(recentSpeech.size()>12)recentSpeech.removeFirst();
+        candidate="";attempts=0;
+        final boolean male=speaker==null?defaultKind==0:Boolean.TRUE.equals(characterGender.get(speaker));
         if(translateSwitch.isChecked()){
             if(!translatorReady){show("Ожидаю загрузку модели перевода…");return;}
             final String fingerprint=cleaned;
             translator.translate(cleaned).addOnSuccessListener(translated->{
                 if(fingerprint.equals(lastSpoken)){
-                    recognized.setText("Озвучка: "+translated);speak(translated,male);
+                    recognized.setText("Озвучка: "+translated);
+                    speak(translated,male);
                 }
-            }).addOnFailureListener(e->{show("Ошибка перевода: "+e.getMessage());});
+            }).addOnFailureListener(e->show("Ошибка перевода: "+e.getMessage()));
         } else speak(cleaned,male);
     }
     private void speak(String phrase, boolean male){
