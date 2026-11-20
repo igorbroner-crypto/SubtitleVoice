@@ -79,6 +79,8 @@ public class MainActivity extends AppCompatActivity {
     private final LinkedHashMap<String, LinkedHashMap<String, CharacterInfo>> profiles = new LinkedHashMap<>();
     private String activeGame = "Без игры";
     private Spinner gameSpinner, translationModeSpinner;
+    private EditText maleNamesInput, femaleNamesInput;
+    private LinearLayout[] settingsTabs;
     private EditText apiKeyInput;
     private boolean updatingGames = false;
     private final ExecutorService translationExecutor = Executors.newSingleThreadExecutor();
@@ -121,7 +123,7 @@ public class MainActivity extends AppCompatActivity {
     private TextView status, recognized, speedLabel, namesLabel;
     private ImageView ocrPreview;
     private Switch showOcrPreviewSwitch;
-    private Spinner maleSpinner, femaleSpinner, defaultSpinner;
+    private Spinner maleSpinner, femaleSpinner;
     private Switch translateSwitch;
     private TextToSpeech tts;
     private Translator translator;
@@ -137,7 +139,7 @@ public class MainActivity extends AppCompatActivity {
     private long activeSpeakerUntil = 0;
     private long lastSpokenAt = 0;
     private float widthFrac = .82f, heightFrac = .17f, centerYFrac = .80f, speechRate = 1.25f;
-    private int maleIndex = 0, femaleIndex = 0, defaultKind = 0, contrastMode = 0;
+    private int maleIndex = 0, femaleIndex = 0, contrastMode = 0;
     private static final float SAME_TEXT_THRESHOLD = .12f;
     private final ActivityResultLauncher<String> cameraPermission = registerForActivityResult(new ActivityResultContracts.RequestPermission(), allowed -> {
         if (allowed) startCamera(); else show("Нужно разрешение камеры");
@@ -153,7 +155,6 @@ public class MainActivity extends AppCompatActivity {
         speechRate = prefs.getFloat("speechRate", 1.25f);
         maleIndex = prefs.getInt("maleVoice", 0);
         femaleIndex = prefs.getInt("femaleVoice", 0);
-        defaultKind = prefs.getInt("defaultKind", 0);
         contrastMode = prefs.getInt("contrastMode", 0);
         audioMode = prefs.getInt("mode", 0) == 1;
         loadProfiles();
@@ -187,167 +188,186 @@ public class MainActivity extends AppCompatActivity {
     private LinearLayout.LayoutParams full() { return new LinearLayout.LayoutParams(-1, -2); }
     private void add(LinearLayout l, View v) { l.addView(v,full()); }
     private void buildUi() {
-        LinearLayout root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL); root.setBackgroundColor(Color.rgb(13,18,29));
-        ScrollView scroll = new ScrollView(this); root.addView(scroll);
-        LinearLayout content = new LinearLayout(this); content.setOrientation(LinearLayout.VERTICAL); content.setPadding(dp(12), dp(10), dp(12), dp(18)); scroll.addView(content);
-        add(content, text("SUBTITLE VOICE   •   Перевод и озвучка", 19));
-        add(content, text("Режим работы", 16));
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Color.rgb(13,18,29));
+        add(root, text("SUBTITLE VOICE", 20));
+        LinearLayout tabBar = new LinearLayout(this);
+        tabBar.setOrientation(LinearLayout.HORIZONTAL);
+        add(root,tabBar);
+        ScrollView scroll = new ScrollView(this);
+        root.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
+        LinearLayout holder = new LinearLayout(this);
+        holder.setOrientation(LinearLayout.VERTICAL);
+        holder.setPadding(dp(12),dp(6),dp(12),dp(20));
+        scroll.addView(holder);
+        settingsTabs = new LinearLayout[3];
+        for(int i=0;i<3;i++){
+            settingsTabs[i]=new LinearLayout(this);
+            settingsTabs[i].setOrientation(LinearLayout.VERTICAL);
+            add(holder,settingsTabs[i]);
+        }
+        String[] tabNames={"Захват","Голоса","Общие"};
+        for(int i=0;i<tabNames.length;i++){
+            final int page=i;
+            Button tab=new Button(this);tab.setText(tabNames[i]);
+            tabBar.addView(tab,new LinearLayout.LayoutParams(0,dp(54),1));
+            tab.setOnClickListener(v->{
+                for(int j=0;j<settingsTabs.length;j++) settingsTabs[j].setVisibility(j==page?View.VISIBLE:View.GONE);
+                scroll.scrollTo(0,0);
+            });
+        }
+        for(int i=0;i<settingsTabs.length;i++)settingsTabs[i].setVisibility(i==0?View.VISIBLE:View.GONE);
+        LinearLayout capture=settingsTabs[0], voices=settingsTabs[1], common=settingsTabs[2];
+
+        add(capture,text("Режим работы",17));
         modeSpinner = new Spinner(this);
-        modeSpinner.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
-            new String[]{"Озвучка по субтитрам", "Озвучка по аудио"}));
-        modeSpinner.setSelection(audioMode ? 1 : 0);
-        add(content, modeSpinner);
-        cameraPanel = new LinearLayout(this);
-        cameraPanel.setOrientation(LinearLayout.VERTICAL);
-        add(content, cameraPanel);
-        audioPanel = new LinearLayout(this);
-        audioPanel.setOrientation(LinearLayout.VERTICAL);
-        add(content, audioPanel);
-        add(audioPanel, text("Режим микрофона: английская речь с телевизора → перевод на русский → голос", 13));
-        audioStatus = text("Микрофон не запущен", 13); add(audioPanel, audioStatus);
-        audioTranscript = text("Распознано: —", 14); add(audioPanel, audioTranscript);
-        add(audioPanel, text("Пол голоса определяется приблизительно по высоте тона, только если речевой движок предоставляет аудиобуфер. Если данных нет, используется выбор ниже.", 12));
-        audioGenderSpinner = new Spinner(this);
-        audioGenderSpinner.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
-            new String[]{"Авто (экспериментально)", "Всегда мужской", "Всегда женский"}));
-        audioGenderSpinner.setSelection(prefs.getInt("audioGenderMode", 0));
-        add(audioPanel, audioGenderSpinner);
-        audioGenderSpinner.setOnItemSelectedListener(new SpinnerListener(i ->
-            prefs.edit().putInt("audioGenderMode", i).apply()));
-        Button audioToggle = new Button(this);
-        audioToggle.setText("Остановить / запустить прослушивание");
-        add(audioPanel, audioToggle);
-        audioToggle.setOnClickListener(v -> {
-            if (microphoneActive) stopMicrophone(); else requestMicrophone();
-        });
-        add(audioPanel, text("Чтобы микрофон не распознавал синтезированную речь повторно, прослушивание приостанавливается на время озвучки. Лучше пользоваться наушниками.", 12));
-        cameraPanel.setVisibility(audioMode ? View.GONE : View.VISIBLE);
-        audioPanel.setVisibility(audioMode ? View.VISIBLE : View.GONE);
-        modeSpinner.setOnItemSelectedListener(new SpinnerListener(i -> switchMode(i == 1)));
-        FrameLayout stage = new FrameLayout(this);
-        stage.setBackgroundColor(Color.BLACK);
-        add(cameraPanel, stage);
-        stage.getLayoutParams().height = dp(300);
-        preview = new PreviewView(this);
-        preview.setScaleType(PreviewView.ScaleType.FILL_CENTER);
-        stage.addView(preview, new FrameLayout.LayoutParams(-1,-1));
-        overlay = new RoiOverlay(); stage.addView(overlay,new FrameLayout.LayoutParams(-1,-1));
-        add(cameraPanel, text("Распознаётся ТОЛЬКО область внутри рамки. Наведи камеру на центр нижней части ТВ.", 12));
-        status = text("Инициализация…", 13); add(cameraPanel,status);
-        recognized = text("Последняя реплика: —", 14); add(cameraPanel,recognized);
-        showOcrPreviewSwitch = new Switch(this);
-        showOcrPreviewSwitch.setText("Показывать реальный кадр OCR (для настройки рамки)");
+        modeSpinner.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,
+            new String[]{"Озвучка по субтитрам","Озвучка по аудио"}));
+        modeSpinner.setSelection(audioMode?1:0);add(capture,modeSpinner);
+        cameraPanel=new LinearLayout(this);cameraPanel.setOrientation(LinearLayout.VERTICAL);add(capture,cameraPanel);
+        audioPanel=new LinearLayout(this);audioPanel.setOrientation(LinearLayout.VERTICAL);add(capture,audioPanel);
+        add(audioPanel,text("Аудио: микрофон → распознавание речи → озвучка; перевод определяется переключателем во вкладке «Общие».",13));
+        audioStatus=text("Микрофон не запущен",13);add(audioPanel,audioStatus);
+        audioTranscript=text("Распознано: —",14);add(audioPanel,audioTranscript);
+        audioGenderSpinner=new Spinner(this);
+        audioGenderSpinner.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,
+            new String[]{"Авто (экспериментально)","Мужской","Женский"}));
+        audioGenderSpinner.setSelection(prefs.getInt("audioGenderMode",0));add(audioPanel,audioGenderSpinner);
+        audioGenderSpinner.setOnItemSelectedListener(new SpinnerListener(i->prefs.edit().putInt("audioGenderMode",i).apply()));
+        Button audioToggle=new Button(this);audioToggle.setText("Запустить / остановить микрофон");add(audioPanel,audioToggle);
+        audioToggle.setOnClickListener(v->{if(microphoneActive)stopMicrophone();else requestMicrophone();});
+        cameraPanel.setVisibility(audioMode?View.GONE:View.VISIBLE);
+        audioPanel.setVisibility(audioMode?View.VISIBLE:View.GONE);
+        modeSpinner.setOnItemSelectedListener(new SpinnerListener(i->switchMode(i==1)));
+        FrameLayout stage=new FrameLayout(this);stage.setBackgroundColor(Color.BLACK);add(cameraPanel,stage);
+        stage.getLayoutParams().height=dp(300);
+        preview=new PreviewView(this);preview.setScaleType(PreviewView.ScaleType.FILL_CENTER);
+        stage.addView(preview,new FrameLayout.LayoutParams(-1,-1));
+        overlay=new RoiOverlay();stage.addView(overlay,new FrameLayout.LayoutParams(-1,-1));
+        add(cameraPanel,text("Распознаётся только область внутри рамки",12));
+        status=text("Инициализация…",13);add(cameraPanel,status);
+        recognized=text("Последняя реплика: —",14);add(cameraPanel,recognized);
+        showOcrPreviewSwitch=new Switch(this);
+        showOcrPreviewSwitch.setText("Показывать реальный фрагмент OCR");
         showOcrPreviewSwitch.setTextColor(Color.WHITE);
-        showOcrPreviewSwitch.setChecked(prefs.getBoolean("debugCrop", true));
-        add(cameraPanel, showOcrPreviewSwitch);
-        showOcrPreviewSwitch.setOnCheckedChangeListener((b, enabled) -> {
-            prefs.edit().putBoolean("debugCrop", enabled).apply();
-            ocrPreview.setVisibility(enabled ? View.VISIBLE : View.GONE);
-        });
-        ocrPreview = new ImageView(this);
-        ocrPreview.setAdjustViewBounds(true);
+        showOcrPreviewSwitch.setChecked(prefs.getBoolean("debugCrop",true));add(cameraPanel,showOcrPreviewSwitch);
+        ocrPreview=new ImageView(this);ocrPreview.setAdjustViewBounds(true);
         ocrPreview.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        ocrPreview.setBackgroundColor(Color.rgb(28, 31, 40));
-        ocrPreview.setMaxHeight(dp(130));
-        ocrPreview.setVisibility(showOcrPreviewSwitch.isChecked() ? View.VISIBLE : View.GONE);
-        add(cameraPanel, ocrPreview);
-        add(cameraPanel, text("Проверка OCR: здесь должны быть видны ВСЕ буквы субтитра, без верхних меню игры.", 12));
-        Button toggle = new Button(this); toggle.setText("Пауза распознавания"); add(cameraPanel,toggle);
-        toggle.setOnClickListener(v -> { started = !started; toggle.setText(started ? "Пауза распознавания" : "Продолжить распознавание"); if (!started && tts != null) tts.stop(); });
-        add(cameraPanel,text("Область субтитров",16));
-        add(cameraPanel,text("Контраст субтитров на фоне игры",16));
-        add(cameraPanel,text("Если у субтитров нет чёрной подложки, попробуй режим «Светлые буквы». Он выделяет текст относительно окружающего фона.",12));
-        Spinner contrastSpinner = new Spinner(this);
-        contrastSpinner.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,
-            new String[]{"HD без фильтра (рекомендуется)", "Светлые буквы на пёстром фоне", "Тёмные буквы на пёстром фоне"}));
-        contrastSpinner.setSelection(contrastMode);
-        contrastSpinner.setOnItemSelectedListener(new SpinnerListener(i -> {
-            contrastMode=i; prefs.edit().putInt("contrastMode",i).apply();
-        }));
-        add(cameraPanel,contrastSpinner);
-        addSlider(content,"Ширина рамки",55,100,Math.round(widthFrac*100), value -> {widthFrac=value/100f; saveRoi();});
-        addSlider(content,"Высота рамки",7,35,Math.round(heightFrac*100), value -> {heightFrac=value/100f; saveRoi();});
-        addSlider(content,"Положение по вертикали",55,95,Math.round(centerYFrac*100), value -> {centerYFrac=value/100f;saveRoi();});
-        speedLabel = text("Скорость речи: " + String.format(Locale.US,"%.2f×",speechRate),16); add(content,speedLabel);
-        SeekBar speechSlider = new SeekBar(this); speechSlider.setMax(130); speechSlider.setProgress(Math.round((speechRate-.7f)*100)); add(content,speechSlider);
-        speechSlider.setOnSeekBarChangeListener(new SimpleSeekListener(v -> {
-            speechRate = .7f + v / 100f; speedLabel.setText("Скорость речи: " + String.format(Locale.US,"%.2f×",speechRate));
-            prefs.edit().putFloat("speechRate",speechRate).apply();
-            if (ttsReady) tts.setSpeechRate(speechRate);
-        }));
-        translateSwitch = new Switch(this); translateSwitch.setText("Переводить английские субтитры на русский"); translateSwitch.setTextColor(Color.WHITE);
-        translateSwitch.setChecked(prefs.getBoolean("translate",true)); add(content,translateSwitch);
-        translateSwitch.setOnCheckedChangeListener((button, enabled) -> { prefs.edit().putBoolean("translate",enabled).apply(); if (enabled) prepareTranslator(); });
-        add(content,text("Перевод: офлайн ML Kit. Интернет используется только при ручном импорте списка персонажей; платные API не нужны.",12));
-        add(content,text("Голоса персонажей (доступные русские голоса телефона)",16));
-        add(content,text("Для мужского и женского голоса выбери разные варианты и проверь их кнопками. Android не сообщает пол голоса автоматически.",12));
-        add(content,text("Мужской голос",13)); maleSpinner = new Spinner(this);add(content,maleSpinner);
-        Button testM = new Button(this);testM.setText("Проверить мужской");add(content,testM);testM.setOnClickListener(v->speak("Привет! Это пример мужского голоса.",true));
-        add(content,text("Женский голос",13)); femaleSpinner = new Spinner(this);add(content,femaleSpinner);
-        Button testF = new Button(this);testF.setText("Проверить женский");add(content,testF);testF.setOnClickListener(v->speak("Привет! Это пример женского голоса.",false));
-        add(content,text("Голос по умолчанию (для реплик без имени)",13));
-        defaultSpinner = new Spinner(this); add(content,defaultSpinner);
-        ArrayAdapter<String> defaultAdapter = new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"Мужской","Женский"});
-        defaultSpinner.setAdapter(defaultAdapter);defaultSpinner.setSelection(defaultKind);
-        defaultSpinner.setOnItemSelectedListener(new SpinnerListener(index -> {defaultKind=index;prefs.edit().putInt("defaultKind",index).apply();}));
-        add(content,text("ПРОФИЛИ ИГР И ПЕРСОНАЖЕЙ",17));
-        add(content,text("Для каждой игры свой список имён, произношений и голосов. Выбор профиля также меняет словарь перевода.",12));
-        gameSpinner=new Spinner(this);add(content,gameSpinner);
+        ocrPreview.setBackgroundColor(Color.rgb(28,31,40));ocrPreview.setMaxHeight(dp(130));
+        ocrPreview.setVisibility(showOcrPreviewSwitch.isChecked()?View.VISIBLE:View.GONE);
+        add(cameraPanel,ocrPreview);
+        showOcrPreviewSwitch.setOnCheckedChangeListener((b,on)->{
+            prefs.edit().putBoolean("debugCrop",on).apply();ocrPreview.setVisibility(on?View.VISIBLE:View.GONE);
+        });
+        Button toggle=new Button(this);toggle.setText("Пауза распознавания");add(cameraPanel,toggle);
+        toggle.setOnClickListener(v->{started=!started;toggle.setText(started?"Пауза распознавания":"Продолжить распознавание");if(!started&&tts!=null)tts.stop();});
+        add(cameraPanel,text("Настройка захвата субтитров",17));
+        Spinner contrastSpinner=new Spinner(this);
+        contrastSpinner.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,
+            new String[]{"HD без фильтра","Светлые буквы","Тёмные буквы"}));
+        contrastSpinner.setSelection(contrastMode);add(cameraPanel,contrastSpinner);
+        contrastSpinner.setOnItemSelectedListener(new SpinnerListener(i->{contrastMode=i;prefs.edit().putInt("contrastMode",i).apply();}));
+        addSlider(cameraPanel,"Ширина рамки",55,100,Math.round(widthFrac*100),v->{widthFrac=v/100f;saveRoi();});
+        addSlider(cameraPanel,"Высота рамки",7,35,Math.round(heightFrac*100),v->{heightFrac=v/100f;saveRoi();});
+        addSlider(cameraPanel,"Положение по вертикали",55,95,Math.round(centerYFrac*100),v->{centerYFrac=v/100f;saveRoi();});
+
+        add(voices,text("Настройка голосов",18));
+        add(voices,text("Мужской голос",14));maleSpinner=new Spinner(this);add(voices,maleSpinner);
+        Button testM=new Button(this);testM.setText("Проверить мужской голос");add(voices,testM);
+        testM.setOnClickListener(v->speak("Привет! Это пример мужского голоса.",true));
+        add(voices,text("Женский голос",14));femaleSpinner=new Spinner(this);add(voices,femaleSpinner);
+        Button testF=new Button(this);testF.setText("Проверить женский голос");add(voices,testF);
+        testF.setOnClickListener(v->speak("Привет! Это пример женского голоса.",false));
+        add(voices,text("Если персонажу не назначен голос, всегда используется мужской.",13));
+        add(voices,text("Профиль игры",17));
+        gameSpinner=new Spinner(this);add(voices,gameSpinner);
         refreshGameSpinner();
         gameSpinner.setOnItemSelectedListener(new SpinnerListener(i->{
-            if(!updatingGames && i>=0 && i<profiles.size()){
-                String selected=new ArrayList<>(profiles.keySet()).get(i);
-                if(!selected.equals(activeGame)){activeGame=selected;activateGame(activeGame);prefs.edit().putString("activeGameV16",activeGame).apply();translationGeneration++;dialogueHistory.clear();renderNames();}
+            if(updatingGames||i<0||i>=profiles.size())return;
+            String selected=new ArrayList<>(profiles.keySet()).get(i);
+            if(!selected.equals(activeGame)){
+                activeGame=selected;activateGame(activeGame);translationGeneration++;dialogueHistory.clear();renderNames();
             }
         }));
-        EditText gameInput=new EditText(this);gameInput.setHint("Название игры: Final Fantasy VII");gameInput.setTextColor(Color.WHITE);gameInput.setSingleLine(true);add(content,gameInput);
-        Button addGame=new Button(this);addGame.setText("Создать / выбрать игру");add(content,addGame);
+        EditText gameInput=new EditText(this);gameInput.setSingleLine(true);gameInput.setTextColor(Color.WHITE);
+        gameInput.setHint("Новая игра, например Final Fantasy VII");add(voices,gameInput);
+        Button addGame=new Button(this);addGame.setText("Создать / выбрать профиль");add(voices,addGame);
         addGame.setOnClickListener(v->{
-            String name=gameInput.getText().toString().trim();
-            if(name.isEmpty())return;
-            profiles.putIfAbsent(name,new LinkedHashMap<>());
-            activeGame=name;activateGame(name);saveProfiles();refreshGameSpinner();renderNames();gameInput.setText("");dialogueHistory.clear();translationGeneration++;
+            String game=gameInput.getText().toString().trim();if(game.isEmpty())return;
+            profiles.putIfAbsent(game,new LinkedHashMap<>());activeGame=game;
+            activateGame(game);saveProfiles();refreshGameSpinner();renderNames();gameInput.setText("");
+            translationGeneration++;dialogueHistory.clear();
         });
-        Button importGame=new Button(this);
-        importGame.setText("Найти персонажей игры в интернете (один раз)"); add(content,importGame);
+        add(voices,text("Мужские персонажи (через запятую)",14));
+        maleNamesInput=new EditText(this);maleNamesInput.setTextColor(Color.WHITE);
+        maleNamesInput.setHint("Cloud=Клауд, Barret=Баррет");maleNamesInput.setMinLines(2);add(voices,maleNamesInput);
+        add(voices,text("Женские персонажи (через запятую)",14));
+        femaleNamesInput=new EditText(this);femaleNamesInput.setTextColor(Color.WHITE);
+        femaleNamesInput.setHint("Tifa=Тифа, Aerith=Айрис");femaleNamesInput.setMinLines(2);add(voices,femaleNamesInput);
+        add(voices,text("Можно вводить просто имена или Имя=Русское произношение. Список сохраняется только в выбранной игре.",12));
+        Button importGame=new Button(this);importGame.setText("Найти персонажей игры в интернете");add(voices,importGame);
         importGame.setOnClickListener(v->{
-            String game=gameInput.getText().toString().trim();
-            if(game.isEmpty())game=activeGame;
-            if(game.equals("Без игры")){show("Сначала введи название игры или выбери профиль");return;}
+            String game=gameInput.getText().toString().trim();if(game.isEmpty())game=activeGame;
+            if(game.equals("Без игры")){Toast.makeText(this,"Сначала выбери или создай игру",Toast.LENGTH_SHORT).show();return;}
             importCharactersFromWikidata(game,importGame);
         });
-        add(content,text("Импорт необязателен: интернет используется только при нажатии этой кнопки. Во время распознавания, офлайн-перевода и озвучки список хранится на телефоне. Wikidata может содержать неполный список.",12));
-        Button removeGame=new Button(this);removeGame.setText("Удалить выбранный профиль игры");add(content,removeGame);
+        Button saveNames=new Button(this);saveNames.setText("Сохранить мужские и женские имена");add(voices,saveNames);
+        saveNames.setOnClickListener(v->saveCommaSeparatedNames());
+        Button removeGame=new Button(this);removeGame.setText("Удалить выбранный профиль");add(voices,removeGame);
         removeGame.setOnClickListener(v->{
-            if("Без игры".equals(activeGame)){Toast.makeText(this,"Базовый профиль нельзя удалить",Toast.LENGTH_SHORT).show();return;}
-            profiles.remove(activeGame);activeGame="Без игры";activateGame(activeGame);saveProfiles();refreshGameSpinner();renderNames();dialogueHistory.clear();translationGeneration++;
+            if("Без игры".equals(activeGame))return;
+            profiles.remove(activeGame);activeGame="Без игры";activateGame(activeGame);
+            saveProfiles();refreshGameSpinner();renderNames();translationGeneration++;dialogueHistory.clear();
         });
-        add(content,text("Персонажи текущей игры",16));
-        namesLabel=text("",13);add(content,namesLabel);renderNames();
-        EditText nameInput = new EditText(this);nameInput.setTextColor(Color.WHITE);nameInput.setHint("Имя в субтитрах: Cloud");nameInput.setSingleLine(true);add(content,nameInput);
-        EditText aliasesInput = new EditText(this);aliasesInput.setTextColor(Color.WHITE);aliasesInput.setHint("Другие написания через запятую: Cloude");aliasesInput.setSingleLine(true);add(content,aliasesInput);
-        EditText russianNameInput=new EditText(this);russianNameInput.setTextColor(Color.WHITE);russianNameInput.setHint("Как произносить по-русски: Клауд");russianNameInput.setSingleLine(true);add(content,russianNameInput);
-        Spinner gender = new Spinner(this);gender.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"Мужской","Женский"}));add(content,gender);
-        Button addName = new Button(this);addName.setText("Добавить / изменить персонажа");add(content,addName);
-        addName.setOnClickListener(v->{
-            String n=nameInput.getText().toString().trim();
-            String ru=russianNameInput.getText().toString().trim();
-            if(n.isEmpty()||ru.isEmpty()){Toast.makeText(this,"Укажи имя и русское произношение",Toast.LENGTH_SHORT).show();return;}
-            LinkedHashMap<String,CharacterInfo> list=profiles.get(activeGame);
-            CharacterInfo info=new CharacterInfo(ru,gender.getSelectedItemPosition()==0);
-            list.put(n,info);
-            for(String alias:aliasesInput.getText().toString().split(",")) if(!alias.trim().isEmpty())list.put(alias.trim(),info);
-            activateGame(activeGame);saveProfiles();renderNames();
-            nameInput.setText("");aliasesInput.setText("");russianNameInput.setText("");
+        namesLabel=text("",12);add(voices,namesLabel);renderNames();
+
+        add(common,text("Общие настройки",18));
+        translateSwitch=new Switch(this);
+        translateSwitch.setText("Переводить на русский");translateSwitch.setTextColor(Color.WHITE);
+        translateSwitch.setChecked(prefs.getBoolean("translate",true));add(common,translateSwitch);
+        translateSwitch.setOnCheckedChangeListener((button,on)->{
+            prefs.edit().putBoolean("translate",on).apply();translationGeneration++;
+            if(on)prepareTranslator();
         });
-        Button remove = new Button(this);remove.setText("Удалить имя / псевдоним из профиля");add(content,remove);
-        remove.setOnClickListener(v->{
-            String n=nameInput.getText().toString().trim();
-            String key=null;for(String k:profiles.get(activeGame).keySet())if(k.equalsIgnoreCase(n))key=k;
-            if(key!=null){CharacterInfo item=profiles.get(activeGame).get(key);profiles.get(activeGame).entrySet().removeIf(e->e.getValue()==item);activateGame(activeGame);saveProfiles();renderNames();}
-        });
-        add(content,text("Совет: зафиксируй телефон на подставке. Если субтитры обновляются быстро, увеличь скорость до 1.4–1.7×.",12));
+        add(common,text("ВКЛ — переводить распознанный текст на русский. ВЫКЛ — озвучивать распознанный текст без перевода. Автоматического определения языка нет.",13));
+        speedLabel=text("Скорость речи: "+String.format(Locale.US,"%.2f×",speechRate),16);add(common,speedLabel);
+        SeekBar speechSlider=new SeekBar(this);speechSlider.setMax(130);
+        speechSlider.setProgress(Math.round((speechRate-.7f)*100));add(common,speechSlider);
+        speechSlider.setOnSeekBarChangeListener(new SimpleSeekListener(v->{
+            speechRate=.7f+v/100f;speedLabel.setText("Скорость речи: "+String.format(Locale.US,"%.2f×",speechRate));
+            prefs.edit().putFloat("speechRate",speechRate).apply();if(ttsReady)tts.setSpeechRate(speechRate);
+        }));
+        add(common,text("Перевод и озвучка выполняются локально. Интернет используется только при ручном поиске персонажей и первоначальной загрузке модели.",12));
         setContentView(root);
+    }
+
+    private String formattedNames(boolean male){
+        LinkedHashMap<String,CharacterInfo> list=profiles.get(activeGame);
+        ArrayList<String> names=new ArrayList<>();
+        if(list!=null)for(Map.Entry<String,CharacterInfo> e:list.entrySet()){
+            CharacterInfo info=e.getValue();if(info.male!=male)continue;
+            names.add(e.getKey().equals(info.ru)?e.getKey():e.getKey()+"="+info.ru);
+        }
+        return String.join(", ",names);
+    }
+    private void saveCommaSeparatedNames(){
+        LinkedHashMap<String,CharacterInfo> list=new LinkedHashMap<>();
+        parseCommaNames(maleNamesInput.getText().toString(),true,list);
+        parseCommaNames(femaleNamesInput.getText().toString(),false,list);
+        profiles.put(activeGame,list);activateGame(activeGame);saveProfiles();renderNames();
+        Toast.makeText(this,"Имена сохранены: "+list.size(),Toast.LENGTH_SHORT).show();
+    }
+    private void parseCommaNames(String source,boolean male,LinkedHashMap<String,CharacterInfo> target){
+        for(String token:source.split("[,\n;]+")){
+            String entry=token.trim();if(entry.isEmpty())continue;
+            String[] pair=entry.split("=",2);
+            String en=pair[0].trim();if(en.isEmpty())continue;
+            String ru=pair.length>1?pair[1].trim():"";
+            CharacterInfo previous=profiles.get(activeGame).get(en);
+            if(ru.isEmpty())ru=previous!=null?previous.ru:en;
+            target.put(en,new CharacterInfo(ru,male));
+        }
     }
     private interface SliderAction {void update(int value);}
     private static class SimpleSeekListener implements SeekBar.OnSeekBarChangeListener {
@@ -555,19 +575,28 @@ public class MainActivity extends AppCompatActivity {
         new AlertDialog.Builder(this).setTitle("Персонажи: "+game+" ("+characters.size()+")")
             .setView(scroll)
             .setNegativeButton("Отмена",(d,w)->{})
-            .setPositiveButton("Сохранить в профиль",(d,w)->{
-                profiles.putIfAbsent(game,new LinkedHashMap<>());
-                LinkedHashMap<String,CharacterInfo> list=profiles.get(game);
-                int added=0;
+            .setPositiveButton("Добавить в поля",(d,w)->{
+                if(!profiles.containsKey(game))profiles.put(game,new LinkedHashMap<>());
+                activeGame=game;activateGame(game);saveProfiles();refreshGameSpinner();renderNames();
+                ArrayList<String> male=new ArrayList<>(),female=new ArrayList<>();
                 for(int i=0;i<characters.size();i++){
                     if(!checks.get(i).isChecked()||genders.get(i).getSelectedItemPosition()==2)continue;
-                    String ru=names.get(i).getText().toString().trim();if(ru.isEmpty())continue;
-                    list.put(characters.get(i).english,new CharacterInfo(ru,genders.get(i).getSelectedItemPosition()==0));added++;
+                    String ru=names.get(i).getText().toString().trim();
+                    String en=characters.get(i).english;
+                    if(en.isEmpty())continue;
+                    String item=ru.isEmpty()||en.equals(ru)?en:en+"="+ru;
+                    (genders.get(i).getSelectedItemPosition()==0?male:female).add(item);
                 }
-                activeGame=game;saveProfiles();activateGame(game);refreshGameSpinner();renderNames();
-                dialogueHistory.clear();translationGeneration++;
-                show("Сохранено персонажей: "+added+". Для игры не потребуется интернет.");
+                appendNames(maleNamesInput,male);
+                appendNames(femaleNamesInput,female);
+                Toast.makeText(this,"Проверь поля и нажми «Сохранить мужские и женские имена»",Toast.LENGTH_LONG).show();
             }).show();
+    }
+
+    private void appendNames(EditText field,ArrayList<String> items){
+        if(items.isEmpty())return;
+        String old=field.getText().toString().trim();
+        field.setText(old+(old.isEmpty()?"":", ")+String.join(", ",items));
     }
 
     private void renderNames(){
@@ -579,6 +608,8 @@ public class MainActivity extends AppCompatActivity {
             b.append(e.getKey()).append(" → ").append(e.getValue().ru).append(" (" ).append(e.getValue().male?"муж.":"жен.").append(")");
         }
         namesLabel.setText(b.length()==0?"В этой игре пока нет персонажей":b.toString());
+        if(maleNamesInput!=null)maleNamesInput.setText(formattedNames(true));
+        if(femaleNamesInput!=null)femaleNamesInput.setText(formattedNames(false));
     }
     // Sort longest names first so Cloud Strife is substituted before Cloud.
     private String protectNames(String english){
@@ -600,6 +631,16 @@ public class MainActivity extends AppCompatActivity {
         for(Map.Entry<String,CharacterInfo> e:list.entrySet())b.append(e.getKey()).append(" = ").append(e.getValue().ru).append("; ");
         return b.toString();
     }
+    private void translateOrRead(String input, java.util.function.Consumer<String> success,
+                                 java.util.function.Consumer<String> failure) {
+        if(input==null||input.trim().isEmpty())return;
+        if(!translateSwitch.isChecked()){
+            success.accept(input);
+            return;
+        }
+        translateWithContext(input,success,failure);
+    }
+
     private void translateWithContext(String input, java.util.function.Consumer<String> success, java.util.function.Consumer<String> failure){
         if(translationMode==0){
             if(!translatorReady){failure.accept("Ожидаю загрузку офлайн-переводчика");return;}
@@ -792,7 +833,7 @@ public class MainActivity extends AppCompatActivity {
         if (selected==1) return true;
         if (selected==2) return false;
         if (pitchMaleVotes + pitchFemaleVotes < 3 || Math.abs(pitchMaleVotes-pitchFemaleVotes)<2)
-            return defaultKind==0;
+            return true;
         return pitchMaleVotes>pitchFemaleVotes;
     }
     private void handleAudioPhrase(String phrase) {
@@ -804,11 +845,8 @@ public class MainActivity extends AppCompatActivity {
         lastAudioText=phrase; lastAudioAt=now;
         final boolean male=audioMaleVoice();
         audioPending=true;
-        if (!translateSwitch.isChecked()) {
-            speakAudio(phrase,male); return;
-        }
         final long generation=translationGeneration;
-        translateWithContext(phrase,r->{
+        translateOrRead(phrase,r->{
             if(generation==translationGeneration && audioMode && microphoneActive)speakAudio(r,male);
             else audioPending=false;
         },error->{
@@ -1151,17 +1189,15 @@ public class MainActivity extends AppCompatActivity {
         recentSpeech.addLast(new SpokenRecord(cleaned,now));
         while(recentSpeech.size()>12)recentSpeech.removeFirst();
         candidate="";attempts=0;
-        final boolean male=speaker==null?defaultKind==0:Boolean.TRUE.equals(characterGender.get(speaker));
-        if(translateSwitch.isChecked()){
-            final String fingerprint=cleaned;
-            final long generation=translationGeneration;
-            translateWithContext(cleaned, translated->{
-                if(generation==translationGeneration && fingerprint.equals(lastSpoken) && !audioMode){
-                    recognized.setText("Озвучка: "+translated);
-                    speak(translated,male);
-                }
-            }, error->show("Ошибка перевода: "+error));
-        } else speak(cleaned,male);
+        final boolean male=speaker==null || characterGender.get(speaker)==null || Boolean.TRUE.equals(characterGender.get(speaker));
+        final String fingerprint=cleaned;
+        final long generation=translationGeneration;
+        translateOrRead(cleaned, translated->{
+            if(generation==translationGeneration && fingerprint.equals(lastSpoken) && !audioMode){
+                recognized.setText("Озвучка: "+translated);
+                speak(translated,male);
+            }
+        }, error->show("Ошибка перевода: "+error));
     }
     private void speak(String phrase, boolean male){
         if(!ttsReady||phrase.trim().isEmpty())return;
