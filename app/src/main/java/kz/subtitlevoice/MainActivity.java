@@ -1,6 +1,11 @@
 package kz.subtitlevoice;
 
 import android.Manifest;
+import android.app.AlertDialog;
+import android.widget.CheckBox;
+import android.widget.ProgressBar;
+import java.net.URLEncoder;
+import java.io.ByteArrayOutputStream;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
@@ -53,6 +58,14 @@ import com.google.mlkit.nl.translate.TranslatorOptions;
 import com.google.mlkit.nl.translate.Translation;
 
 import java.util.*;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.io.OutputStream;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import android.text.InputType;
 import java.util.regex.*;
 
 /** Camera->cropped OCR->optional offline translation->speech. No screenshot storage. */
@@ -63,6 +76,31 @@ public class MainActivity extends AppCompatActivity {
     private final Map<String, Boolean> characterGender = new LinkedHashMap<>();
     private final ArrayList<Voice> russianVoices = new ArrayList<>();
     private SharedPreferences prefs;
+    private final LinkedHashMap<String, LinkedHashMap<String, CharacterInfo>> profiles = new LinkedHashMap<>();
+    private String activeGame = "Без игры";
+    private Spinner gameSpinner, translationModeSpinner;
+    private EditText apiKeyInput;
+    private boolean updatingGames = false;
+    private final ExecutorService translationExecutor = Executors.newSingleThreadExecutor();
+    private final Deque<String> dialogueHistory = new ArrayDeque<>();
+    private long translationGeneration = 0;
+    private int translationMode = 0;
+    private static final class CharacterInfo {
+        String ru;
+        boolean male;
+        CharacterInfo(String ru, boolean male) { this.ru=ru; this.male=male; }
+    }
+
+    private static final class ImportedCharacter {
+        String english, russian;
+        // null means Wikidata supplied no reliable male/female category.
+        Boolean male;
+        boolean selected = true;
+        ImportedCharacter(String en, String ru, Boolean gender) {
+            english=en; russian=ru; male=gender;
+        }
+    }
+    private static final String WD_API = "https://www.wikidata.org/w/api.php";
     private boolean audioMode = false, microphoneActive = false, audioPending = false, audioTtsPlaying = false;
     private SpeechRecognizer speechRecognizer;
     private LinearLayout cameraPanel, audioPanel;
@@ -117,7 +155,11 @@ public class MainActivity extends AppCompatActivity {
         defaultKind = prefs.getInt("defaultKind", 0);
         contrastMode = prefs.getInt("contrastMode", 0);
         audioMode = prefs.getInt("mode", 0) == 1;
-        loadCharacters();
+        loadProfiles();
+        translationMode = 0;
+        activeGame = prefs.getString("activeGameV16", "Без игры");
+        if (!profiles.containsKey(activeGame)) activeGame="Без игры";
+        activateGame(activeGame);
         buildUi();
         tts = new TextToSpeech(this, code -> handler.post(() -> {
             ttsReady = code == TextToSpeech.SUCCESS;
@@ -235,6 +277,7 @@ public class MainActivity extends AppCompatActivity {
         translateSwitch = new Switch(this); translateSwitch.setText("Переводить английские субтитры на русский"); translateSwitch.setTextColor(Color.WHITE);
         translateSwitch.setChecked(prefs.getBoolean("translate",true)); add(content,translateSwitch);
         translateSwitch.setOnCheckedChangeListener((button, enabled) -> { prefs.edit().putBoolean("translate",enabled).apply(); if (enabled) prepareTranslator(); });
+        add(content,text("Перевод: офлайн ML Kit. Интернет используется только при ручном импорте списка персонажей; платные API не нужны.",12));
         add(content,text("Голоса персонажей (доступные русские голоса телефона)",16));
         add(content,text("Для мужского и женского голоса выбери разные варианты и проверь их кнопками. Android не сообщает пол голоса автоматически.",12));
         add(content,text("Мужской голос",13)); maleSpinner = new Spinner(this);add(content,maleSpinner);
@@ -246,19 +289,62 @@ public class MainActivity extends AppCompatActivity {
         ArrayAdapter<String> defaultAdapter = new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"Мужской","Женский"});
         defaultSpinner.setAdapter(defaultAdapter);defaultSpinner.setSelection(defaultKind);
         defaultSpinner.setOnItemSelectedListener(new SpinnerListener(index -> {defaultKind=index;prefs.edit().putInt("defaultKind",index).apply();}));
-        add(content,text("Привязка голоса по имени: отдельная подпись сверху/слева, имя перед тире или двоеточием",16));
-        add(content,text("Имена отделяются от реплик до перевода и озвучки. Для подписи другим цветом имя нужно добавить в список персонажей; без подписи используется голос по умолчанию.",12));
-        namesLabel=text("",13);add(content,namesLabel); renderNames();
-        EditText nameInput = new EditText(this);nameInput.setTextColor(Color.WHITE);nameInput.setHintTextColor(0xffaaaaaa);nameInput.setHint("Имя персонажа: Маша");nameInput.setSingleLine(true);add(content,nameInput);
-        Spinner gender = new Spinner(this);gender.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item,new String[]{"Мужской", "Женский"}));add(content,gender);
-        Button addName = new Button(this);addName.setText("Добавить / изменить персонажа");add(content,addName);
-        addName.setOnClickListener(v -> {
-            String n=nameInput.getText().toString().trim().toLowerCase(Locale.ROOT);
-            if(n.isEmpty())return;
-            characterGender.put(n,gender.getSelectedItemPosition()==0);saveCharacters();renderNames();nameInput.setText("");
+        add(content,text("ПРОФИЛИ ИГР И ПЕРСОНАЖЕЙ",17));
+        add(content,text("Для каждой игры свой список имён, произношений и голосов. Выбор профиля также меняет словарь перевода.",12));
+        gameSpinner=new Spinner(this);add(content,gameSpinner);
+        refreshGameSpinner();
+        gameSpinner.setOnItemSelectedListener(new SpinnerListener(i->{
+            if(!updatingGames && i>=0 && i<profiles.size()){
+                String selected=new ArrayList<>(profiles.keySet()).get(i);
+                if(!selected.equals(activeGame)){activeGame=selected;activateGame(activeGame);prefs.edit().putString("activeGameV16",activeGame).apply();translationGeneration++;dialogueHistory.clear();renderNames();}
+            }
+        }));
+        EditText gameInput=new EditText(this);gameInput.setHint("Название игры: Final Fantasy VII");gameInput.setTextColor(Color.WHITE);gameInput.setSingleLine(true);add(content,gameInput);
+        Button addGame=new Button(this);addGame.setText("Создать / выбрать игру");add(content,addGame);
+        addGame.setOnClickListener(v->{
+            String name=gameInput.getText().toString().trim();
+            if(name.isEmpty())return;
+            profiles.putIfAbsent(name,new LinkedHashMap<>());
+            activeGame=name;activateGame(name);saveProfiles();refreshGameSpinner();renderNames();gameInput.setText("");dialogueHistory.clear();translationGeneration++;
         });
-        Button remove = new Button(this);remove.setText("Удалить персонажа по имени");add(content,remove);
-        remove.setOnClickListener(v->{String n=nameInput.getText().toString().trim().toLowerCase(Locale.ROOT); characterGender.remove(n);saveCharacters();renderNames();});
+        Button importGame=new Button(this);
+        importGame.setText("Найти персонажей игры в интернете (один раз)"); add(content,importGame);
+        importGame.setOnClickListener(v->{
+            String game=gameInput.getText().toString().trim();
+            if(game.isEmpty())game=activeGame;
+            if(game.equals("Без игры")){show("Сначала введи название игры или выбери профиль");return;}
+            importCharactersFromWikidata(game,importGame);
+        });
+        add(content,text("Импорт необязателен: интернет используется только при нажатии этой кнопки. Во время распознавания, офлайн-перевода и озвучки список хранится на телефоне. Wikidata может содержать неполный список.",12));
+        Button removeGame=new Button(this);removeGame.setText("Удалить выбранный профиль игры");add(content,removeGame);
+        removeGame.setOnClickListener(v->{
+            if("Без игры".equals(activeGame)){Toast.makeText(this,"Базовый профиль нельзя удалить",Toast.LENGTH_SHORT).show();return;}
+            profiles.remove(activeGame);activeGame="Без игры";activateGame(activeGame);saveProfiles();refreshGameSpinner();renderNames();dialogueHistory.clear();translationGeneration++;
+        });
+        add(content,text("Персонажи текущей игры",16));
+        namesLabel=text("",13);add(content,namesLabel);renderNames();
+        EditText nameInput = new EditText(this);nameInput.setTextColor(Color.WHITE);nameInput.setHint("Имя в субтитрах: Cloud");nameInput.setSingleLine(true);add(content,nameInput);
+        EditText aliasesInput = new EditText(this);aliasesInput.setTextColor(Color.WHITE);aliasesInput.setHint("Другие написания через запятую: Cloude");aliasesInput.setSingleLine(true);add(content,aliasesInput);
+        EditText russianNameInput=new EditText(this);russianNameInput.setTextColor(Color.WHITE);russianNameInput.setHint("Как произносить по-русски: Клауд");russianNameInput.setSingleLine(true);add(content,russianNameInput);
+        Spinner gender = new Spinner(this);gender.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,new String[]{"Мужской","Женский"}));add(content,gender);
+        Button addName = new Button(this);addName.setText("Добавить / изменить персонажа");add(content,addName);
+        addName.setOnClickListener(v->{
+            String n=nameInput.getText().toString().trim();
+            String ru=russianNameInput.getText().toString().trim();
+            if(n.isEmpty()||ru.isEmpty()){Toast.makeText(this,"Укажи имя и русское произношение",Toast.LENGTH_SHORT).show();return;}
+            LinkedHashMap<String,CharacterInfo> list=profiles.get(activeGame);
+            CharacterInfo info=new CharacterInfo(ru,gender.getSelectedItemPosition()==0);
+            list.put(n,info);
+            for(String alias:aliasesInput.getText().toString().split(",")) if(!alias.trim().isEmpty())list.put(alias.trim(),info);
+            activateGame(activeGame);saveProfiles();renderNames();
+            nameInput.setText("");aliasesInput.setText("");russianNameInput.setText("");
+        });
+        Button remove = new Button(this);remove.setText("Удалить имя / псевдоним из профиля");add(content,remove);
+        remove.setOnClickListener(v->{
+            String n=nameInput.getText().toString().trim();
+            String key=null;for(String k:profiles.get(activeGame).keySet())if(k.equalsIgnoreCase(n))key=k;
+            if(key!=null){CharacterInfo item=profiles.get(activeGame).get(key);profiles.get(activeGame).entrySet().removeIf(e->e.getValue()==item);activateGame(activeGame);saveProfiles();renderNames();}
+        });
         add(content,text("Совет: зафиксируй телефон на подставке. Если субтитры обновляются быстро, увеличь скорость до 1.4–1.7×.",12));
         setContentView(root);
     }
@@ -281,14 +367,282 @@ public class MainActivity extends AppCompatActivity {
     }
     private void saveRoi() { prefs.edit().putFloat("roiWidth",widthFrac).putFloat("roiHeight",heightFrac).putFloat("roiCenter",centerYFrac).apply(); }
     private void show(String message) { if(status!=null)status.setText(message); }
-    private void loadCharacters(){String raw=prefs.getString("characters","Вася|1;Петя|1;Маша|0;Марина|0");
-        for(String item:raw.split(";")){String[] a=item.split("\\|",2);if(a.length==2)characterGender.put(a[0].toLowerCase(Locale.ROOT),"1".equals(a[1]));}}
-    private void saveCharacters(){StringBuilder b=new StringBuilder();for(Map.Entry<String,Boolean> e:characterGender.entrySet()){
-        if(b.length()>0)b.append(';');b.append(e.getKey()).append('|').append(e.getValue()?1:0);
-    }prefs.edit().putString("characters",b.toString()).apply();}
-    private void renderNames(){StringBuilder b=new StringBuilder();for(Map.Entry<String,Boolean> e:characterGender.entrySet()){
-        if(b.length()>0)b.append("  •  ");b.append(e.getKey()).append(" — ").append(e.getValue()?"муж.":"жен.");
-    }namesLabel.setText(b.length()==0?"Пока нет персонажей":b.toString());}
+    private void loadProfiles(){
+        profiles.put("Без игры", new LinkedHashMap<>());
+        try{
+            String json=prefs.getString("gameProfilesV16", "");
+            if(!json.isEmpty()){
+                JSONObject root=new JSONObject(json);
+                Iterator<String> games=root.keys();
+                while(games.hasNext()){
+                    String game=games.next();JSONObject obj=root.getJSONObject(game);
+                    LinkedHashMap<String,CharacterInfo> list=new LinkedHashMap<>();
+                    Iterator<String> names=obj.keys();
+                    while(names.hasNext()){
+                        String alias=names.next();JSONObject c=obj.getJSONObject(alias);
+                        list.put(alias,new CharacterInfo(c.optString("ru",alias),c.optBoolean("male",true)));
+                    }
+                    profiles.put(game,list);
+                }
+                return;
+            }
+        }catch(Exception ignored){}
+        // Migrate old global speaker list once, without losing it on upgrade.
+        String raw=prefs.getString("characters","Вася|1;Петя|1;Маша|0;Марина|0");
+        for(String item:raw.split(";")){
+            String[] pair=item.split("\\|",2);
+            if(pair.length==2)profiles.get("Без игры").put(pair[0],new CharacterInfo(pair[0],"1".equals(pair[1])));
+        }
+        saveProfiles();
+    }
+    private void activateGame(String game){
+        characterGender.clear();
+        LinkedHashMap<String,CharacterInfo> list=profiles.get(game);
+        if(list!=null)for(Map.Entry<String,CharacterInfo> e:list.entrySet())characterGender.put(e.getKey().toLowerCase(Locale.ROOT),e.getValue().male);
+        prefs.edit().putString("activeGameV16",game).apply();
+    }
+    private void refreshGameSpinner(){
+        if(gameSpinner==null)return;
+        updatingGames=true;
+        ArrayList<String> names=new ArrayList<>(profiles.keySet());
+        gameSpinner.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,names));
+        gameSpinner.setSelection(Math.max(0,names.indexOf(activeGame)));
+        updatingGames=false;
+    }
+    private void saveProfiles(){
+        try{
+            JSONObject obj=new JSONObject();
+            for(Map.Entry<String,LinkedHashMap<String,CharacterInfo>> game:profiles.entrySet()){
+                JSONObject chars=new JSONObject();
+                for(Map.Entry<String,CharacterInfo> e:game.getValue().entrySet()){
+                    JSONObject c=new JSONObject();c.put("ru",e.getValue().ru);c.put("male",e.getValue().male);chars.put(e.getKey(),c);
+                }
+                obj.put(game.getKey(),chars);
+            }
+            prefs.edit().putString("gameProfilesV16",obj.toString()).apply();
+        }catch(Exception ignored){}
+    }
+    /** Wikidata import is an explicit, one-shot user action. Never runs in the recognition loop. */
+    private void importCharactersFromWikidata(String requestedGame, Button button) {
+        button.setEnabled(false);
+        String originalLabel=button.getText().toString();
+        button.setText("Загрузка списка персонажей…");
+        translationExecutor.execute(() -> {
+            try {
+                ArrayList<ImportedCharacter> found=fetchGameCharacters(requestedGame);
+                handler.post(() -> {
+                    button.setEnabled(true);button.setText(originalLabel);
+                    if(found.isEmpty()){
+                        new AlertDialog.Builder(this)
+                            .setTitle("Персонажи не найдены")
+                            .setMessage("В Wikidata нет привязанного списка персонажей для «"+requestedGame+"» или данные неполные. Можно добавить имена вручную. Это не ошибка офлайн-распознавания.")
+                            .setPositiveButton("Понятно",(d,w)->{}).show();
+                    } else showImportReview(requestedGame,found);
+                });
+            } catch(Exception ex) {
+                handler.post(() -> {button.setEnabled(true);button.setText(originalLabel);
+                    new AlertDialog.Builder(this).setTitle("Не получилось загрузить список")
+                        .setMessage("Проверь интернет или название игры. Подробности: "+ex.getMessage())
+                        .setPositiveButton("ОК",(d,w)->{}).show();
+                });
+            }
+        });
+    }
+
+    private JSONObject wikidataGet(String params) throws Exception {
+        URL url=new URL(WD_API+"?format=json&"+params);
+        HttpURLConnection c=(HttpURLConnection)url.openConnection();
+        c.setConnectTimeout(6500);c.setReadTimeout(7500);
+        c.setRequestProperty("User-Agent","SubtitleVoice/1.7 (Android personal offline subtitle assistant; Wikidata character import)");
+        c.setRequestProperty("Accept","application/json");
+        try {
+            if(c.getResponseCode()!=200)throw new Exception("Wikidata HTTP "+c.getResponseCode());
+            try(InputStream in=c.getInputStream();ByteArrayOutputStream data=new ByteArrayOutputStream()) {
+                byte[] buf=new byte[8192];int count;
+                while((count=in.read(buf))!=-1){ data.write(buf,0,count); if(data.size()>1500000)throw new Exception("Слишком большой ответ"); }
+                return new JSONObject(data.toString("UTF-8"));
+            }
+        } finally {c.disconnect();}
+    }
+    private String encode(String s) throws Exception {return URLEncoder.encode(s,"UTF-8");}
+    private String label(JSONObject entity,String lang) {
+        return entity.optJSONObject("labels") == null ? "" :
+            entity.optJSONObject("labels").optJSONObject(lang) == null ? "" :
+            entity.optJSONObject("labels").optJSONObject(lang).optString("value", "");
+    }
+    private String claimEntityId(JSONObject entity,String property) {
+        JSONArray a=entity.optJSONObject("claims")==null?null:entity.optJSONObject("claims").optJSONArray(property);
+        if(a==null||a.length()==0)return "";
+        JSONObject snak=a.optJSONObject(0)==null?null:a.optJSONObject(0).optJSONObject("mainsnak");
+        JSONObject value=snak==null||snak.optJSONObject("datavalue")==null?null:snak.getJSONObject("datavalue").optJSONObject("value");
+        return value==null?"":value.optString("id","");
+    }
+    private ArrayList<ImportedCharacter> fetchGameCharacters(String game) throws Exception {
+        JSONObject search=wikidataGet("action=wbsearchentities&language=en&type=item&limit=8&search="+encode(game));
+        JSONArray hits=search.optJSONArray("search");
+        if(hits==null||hits.length()==0)return new ArrayList<>();
+        LinkedHashSet<String> ids=new LinkedHashSet<>();
+        for(int i=0;i<hits.length();i++){
+            JSONObject item=hits.optJSONObject(i);
+            if(item!=null && item.optString("id").matches("Q[0-9]+"))ids.add(item.optString("id"));
+        }
+        JSONObject games=wikidataGet("action=wbgetentities&props=claims%7Clabels&languages=en%7Cru&ids="+encode(String.join("|",ids)));
+        JSONObject gameEntities=games.optJSONObject("entities");
+        if(gameEntities==null)return new ArrayList<>();
+        LinkedHashSet<String> characterIds=new LinkedHashSet<>();
+        for(String id:ids){
+            JSONObject entity=gameEntities.optJSONObject(id);
+            if(entity==null)continue;
+            String gameLabel=label(entity,"en");
+            // Avoid accidentally importing a similarly named film/novel/game.
+            if(gameLabel.isEmpty() || !(gameLabel.equalsIgnoreCase(game)||gameLabel.toLowerCase(Locale.ROOT).contains(game.toLowerCase(Locale.ROOT))
+                ||game.toLowerCase(Locale.ROOT).contains(gameLabel.toLowerCase(Locale.ROOT))))continue;
+            JSONObject claims=entity.optJSONObject("claims");
+            JSONArray characters=claims==null?null:claims.optJSONArray("P674"); // characters
+            if(characters==null)continue;
+            for(int i=0;i<characters.length()&&characterIds.size()<150;i++){
+                JSONObject statement=characters.optJSONObject(i);
+                JSONObject snak=statement==null?null:statement.optJSONObject("mainsnak");
+                JSONObject val=snak==null?null:snak.optJSONObject("datavalue");
+                JSONObject obj=val==null?null:val.optJSONObject("value");
+                String charId=obj==null?"":obj.optString("id","");
+                if(charId.matches("Q[0-9]+"))characterIds.add(charId);
+            }
+            if(!characterIds.isEmpty())break;
+        }
+        ArrayList<ImportedCharacter> result=new ArrayList<>();
+        if(characterIds.isEmpty())return result;
+        ArrayList<String> allIds=new ArrayList<>(characterIds);
+        for(int start=0;start<allIds.size();start+=35){
+            String batch=String.join("|",allIds.subList(start,Math.min(start+35,allIds.size())));
+            JSONObject response=wikidataGet("action=wbgetentities&props=claims%7Clabels&languages=en%7Cru&ids="+encode(batch));
+            JSONObject characters=response.optJSONObject("entities");
+            if(characters==null)continue;
+            for(String id:allIds.subList(start,Math.min(start+35,allIds.size()))){
+                JSONObject item=characters.optJSONObject(id);if(item==null)continue;
+                String en=label(item,"en"), ru=label(item,"ru");
+                if(en.isEmpty())continue;
+                if(ru.isEmpty())ru=en; // no guessing a transliteration
+                String gender=claimEntityId(item,"P21");
+                Boolean male=gender.equals("Q6581097")?Boolean.TRUE:
+                    gender.equals("Q6581072")?Boolean.FALSE:null;
+                result.add(new ImportedCharacter(en,ru,male));
+            }
+        }
+        result.sort((a,b)->a.english.compareToIgnoreCase(b.english));
+        return result;
+    }
+    private void showImportReview(String game,ArrayList<ImportedCharacter> characters){
+        ScrollView scroll=new ScrollView(this);
+        LinearLayout content=new LinearLayout(this);content.setPadding(dp(12),dp(8),dp(12),dp(8));
+        content.setOrientation(LinearLayout.VERTICAL);scroll.addView(content);
+        TextView intro=text("Проверь найденные имена и произношения. Пол без подтверждения источника отмечен как «Неизвестно» — выбери голос вручную. Снятие галочки исключает персонажа.",13);
+        intro.setTextColor(Color.BLACK);add(content,intro);
+        ArrayList<CheckBox> checks=new ArrayList<>();
+        ArrayList<EditText> names=new ArrayList<>();
+        ArrayList<Spinner> genders=new ArrayList<>();
+        for(ImportedCharacter item:characters){
+            CheckBox box=new CheckBox(this);box.setText(item.english);
+            box.setTextColor(Color.BLACK);box.setChecked(true);add(content,box);checks.add(box);
+            EditText russian=new EditText(this);russian.setText(item.russian);
+            russian.setSingleLine(true);russian.setTextColor(Color.BLACK);russian.setHint("Произношение по-русски");add(content,russian);names.add(russian);
+            Spinner gender=new Spinner(this);
+            gender.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,
+                new String[]{"Мужской голос","Женский голос","Неизвестно — не импортировать"}));
+            gender.setSelection(item.male==null?2:(item.male?0:1));add(content,gender);genders.add(gender);
+        }
+        new AlertDialog.Builder(this).setTitle("Персонажи: "+game+" ("+characters.size()+")")
+            .setView(scroll)
+            .setNegativeButton("Отмена",(d,w)->{})
+            .setPositiveButton("Сохранить в профиль",(d,w)->{
+                profiles.putIfAbsent(game,new LinkedHashMap<>());
+                LinkedHashMap<String,CharacterInfo> list=profiles.get(game);
+                int added=0;
+                for(int i=0;i<characters.size();i++){
+                    if(!checks.get(i).isChecked()||genders.get(i).getSelectedItemPosition()==2)continue;
+                    String ru=names.get(i).getText().toString().trim();if(ru.isEmpty())continue;
+                    list.put(characters.get(i).english,new CharacterInfo(ru,genders.get(i).getSelectedItemPosition()==0));added++;
+                }
+                activeGame=game;saveProfiles();activateGame(game);refreshGameSpinner();renderNames();
+                dialogueHistory.clear();translationGeneration++;
+                show("Сохранено персонажей: "+added+". Для игры не потребуется интернет.");
+            }).show();
+    }
+
+    private void renderNames(){
+        if(namesLabel==null)return;
+        StringBuilder b=new StringBuilder();
+        LinkedHashMap<String,CharacterInfo> list=profiles.get(activeGame);
+        if(list!=null)for(Map.Entry<String,CharacterInfo> e:list.entrySet()){
+            if(b.length()>0)b.append("\n");
+            b.append(e.getKey()).append(" → ").append(e.getValue().ru).append(" (" ).append(e.getValue().male?"муж.":"жен.").append(")");
+        }
+        namesLabel.setText(b.length()==0?"В этой игре пока нет персонажей":b.toString());
+    }
+    // Sort longest names first so Cloud Strife is substituted before Cloud.
+    private String protectNames(String english){
+        LinkedHashMap<String,CharacterInfo> list=profiles.get(activeGame);
+        if(list==null)return english;
+        List<String> names=new ArrayList<>(list.keySet());names.sort((a,b)->Integer.compare(b.length(),a.length()));
+        String output=english;
+        for(String name:names){
+            if(name.isEmpty())continue;
+            output=Pattern.compile("(?<![\\p{L}\\p{N}])"+Pattern.quote(name)+"(?![\\p{L}\\p{N}])",Pattern.CASE_INSENSITIVE|Pattern.UNICODE_CASE)
+                .matcher(output).replaceAll(Matcher.quoteReplacement(list.get(name).ru));
+        }
+        return output;
+    }
+    private String glossary(){
+        LinkedHashMap<String,CharacterInfo> list=profiles.get(activeGame);
+        if(list==null||list.isEmpty())return "(нет)";
+        StringBuilder b=new StringBuilder();
+        for(Map.Entry<String,CharacterInfo> e:list.entrySet())b.append(e.getKey()).append(" = ").append(e.getValue().ru).append("; ");
+        return b.toString();
+    }
+    private void translateWithContext(String input, java.util.function.Consumer<String> success, java.util.function.Consumer<String> failure){
+        if(translationMode==0){
+            if(!translatorReady){failure.accept("Ожидаю загрузку офлайн-переводчика");return;}
+            // Name normalization works offline, but ML Kit still translates one phrase at a time.
+            translator.translate(protectNames(input))
+                .addOnSuccessListener(r->{rememberDialogue(input,r);success.accept(r);})
+                .addOnFailureListener(e->failure.accept(e.getMessage()));
+            return;
+        }
+        String key=prefs.getString("onlineApiKeyV16","").trim();
+        if(key.isEmpty()){failure.accept("Добавь OpenAI API-ключ или включи офлайн-перевод");return;}
+        final String game=activeGame, glossarySnapshot=glossary();
+        final ArrayList<String> history=new ArrayList<>(dialogueHistory);
+        translationExecutor.execute(()->{
+            HttpURLConnection conn=null;
+            try{
+                conn=(HttpURLConnection)new URL("https://api.openai.com/v1/chat/completions").openConnection();
+                conn.setRequestMethod("POST");conn.setConnectTimeout(3500);conn.setReadTimeout(7000);
+                conn.setDoOutput(true);conn.setRequestProperty("Content-Type","application/json; charset=utf-8");
+                conn.setRequestProperty("Authorization","Bearer "+key);
+                String rules="Translate the newest English video-game dialogue to natural spoken Russian, not word-for-word. " +
+                    "Preserve meaning, emotions, pronouns and character context. Only output the translation, no commentary. " +
+                    "Game: "+game+". Character name glossary (must use these exact Russian spellings): "+glossarySnapshot+
+                    ". Previous dialogue lines are context ONLY; do not translate them again. Keep the new utterance concise.";
+                JSONArray messages=new JSONArray();
+                messages.put(new JSONObject().put("role","system").put("content",rules));
+                messages.put(new JSONObject().put("role","user").put("content","Context:\n"+String.join("\n",history)+"\nNEW LINE:\n"+input));
+                JSONObject request=new JSONObject().put("model","gpt-4.1-mini").put("messages",messages).put("max_tokens",240).put("temperature",0.25);
+                try(OutputStream out=conn.getOutputStream()){out.write(request.toString().getBytes(StandardCharsets.UTF_8));}
+                int code=conn.getResponseCode();
+                InputStream in=code<300?conn.getInputStream():conn.getErrorStream();
+                byte[] bytes=in.readAllBytes();String body=new String(bytes,StandardCharsets.UTF_8);
+                if(code>=300)throw new Exception("API HTTP "+code+": "+body.substring(0,Math.min(body.length(),180)));
+                String translated=new JSONObject(body).getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content").trim();
+                if(translated.isEmpty())throw new Exception("Пустой перевод");
+                handler.post(()->{if(game.equals(activeGame)){rememberDialogue(input,translated);success.accept(translated);}});
+            }catch(Exception e){handler.post(()->failure.accept(e.getMessage()==null?"Сетевая ошибка":e.getMessage()));}
+            finally{if(conn!=null)conn.disconnect();}
+        });
+    }
+    private void rememberDialogue(String source,String translation){
+        dialogueHistory.addLast("EN: "+source+" | RU: "+translation);
+        while(dialogueHistory.size()>8)dialogueHistory.removeFirst();
+    }
     private void populateVoices(){
         russianVoices.clear();
         if(tts.getVoices()!=null)for(Voice voice:tts.getVoices())if("ru".equals(voice.getLocale().getLanguage()))russianVoices.add(voice);
@@ -319,6 +673,7 @@ public class MainActivity extends AppCompatActivity {
     }
     private void switchMode(boolean useAudio) {
         if (useAudio == audioMode) return;
+        translationGeneration++;
         audioMode = useAudio;
         prefs.edit().putInt("mode", audioMode ? 1 : 0).apply();
         cameraPanel.setVisibility(audioMode ? View.GONE : View.VISIBLE);
@@ -451,20 +806,15 @@ public class MainActivity extends AppCompatActivity {
         if (!translateSwitch.isChecked()) {
             speakAudio(phrase,male); return;
         }
-        if (!translatorReady) {
-            audioStatus.setText("Ожидаю модель перевода. Проверь интернет…");
-            audioPending=false; scheduleMicrophone(700); return;
-        }
-        translator.translate(phrase)
-            .addOnSuccessListener(r -> {
-                if (audioMode && microphoneActive) speakAudio(r,male);
-                else audioPending=false;
-            })
-            .addOnFailureListener(e -> {
-                audioPending=false;
-                audioStatus.setText("Ошибка перевода: " + e.getMessage());
-                scheduleMicrophone(350);
-            });
+        final long generation=translationGeneration;
+        translateWithContext(phrase,r->{
+            if(generation==translationGeneration && audioMode && microphoneActive)speakAudio(r,male);
+            else audioPending=false;
+        },error->{
+            audioPending=false;
+            audioStatus.setText("Ошибка перевода: " + error);
+            scheduleMicrophone(350);
+        });
     }
     private void speakAudio(String text, boolean male) {
         audioPending=false;
@@ -802,14 +1152,14 @@ public class MainActivity extends AppCompatActivity {
         candidate="";attempts=0;
         final boolean male=speaker==null?defaultKind==0:Boolean.TRUE.equals(characterGender.get(speaker));
         if(translateSwitch.isChecked()){
-            if(!translatorReady){show("Ожидаю загрузку модели перевода…");return;}
             final String fingerprint=cleaned;
-            translator.translate(cleaned).addOnSuccessListener(translated->{
-                if(fingerprint.equals(lastSpoken)){
+            final long generation=translationGeneration;
+            translateWithContext(cleaned, translated->{
+                if(generation==translationGeneration && fingerprint.equals(lastSpoken) && !audioMode){
                     recognized.setText("Озвучка: "+translated);
                     speak(translated,male);
                 }
-            }).addOnFailureListener(e->show("Ошибка перевода: "+e.getMessage()));
+            }, error->show("Ошибка перевода: "+error));
         } else speak(cleaned,male);
     }
     private void speak(String phrase, boolean male){
@@ -831,6 +1181,7 @@ public class MainActivity extends AppCompatActivity {
     }
     @Override protected void onDestroy(){
         stopMicrophone();
+        translationExecutor.shutdownNow();
         if (speechRecognizer != null) {speechRecognizer.destroy();speechRecognizer=null;}
         handler.removeCallbacksAndMessages(null);started=false;
         recognizer.close();cameraExecutor.shutdown();if(translator!=null)translator.close();if(tts!=null){tts.stop();tts.shutdown();}super.onDestroy();}
