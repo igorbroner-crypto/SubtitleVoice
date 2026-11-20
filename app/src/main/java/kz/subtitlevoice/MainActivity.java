@@ -7,6 +7,9 @@ import android.widget.ProgressBar;
 import java.net.URLEncoder;
 import java.io.ByteArrayOutputStream;
 import android.content.pm.PackageManager;
+import android.content.pm.ActivityInfo;
+import android.content.res.Configuration;
+import android.view.Surface;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -21,12 +24,8 @@ import java.util.concurrent.Executors;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.speech.RecognizerIntent;
-import android.speech.RecognitionListener;
-import android.speech.SpeechRecognizer;
 import android.content.Intent;
 import android.os.Build;
-import android.speech.tts.UtteranceProgressListener;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.Voice;
 import android.view.Gravity;
@@ -39,12 +38,19 @@ import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.camera.core.CameraSelector;
+import androidx.camera.core.Camera;
+import androidx.camera.core.UseCaseGroup;
+import androidx.camera.core.ViewPort;
+import androidx.camera.core.ZoomState;
 import androidx.camera.core.ImageAnalysis;
 import androidx.camera.core.ImageProxy;
 import androidx.camera.core.Preview;
 import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.camera.view.PreviewView;
 import androidx.core.content.ContextCompat;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
 
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.mlkit.vision.common.InputImage;
@@ -58,11 +64,9 @@ import com.google.mlkit.nl.translate.TranslatorOptions;
 import com.google.mlkit.nl.translate.Translation;
 
 import java.util.*;
-import org.json.JSONArray;
 import org.json.JSONObject;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.io.OutputStream;
 import java.io.InputStream;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -87,15 +91,12 @@ public class MainActivity extends AppCompatActivity {
     private SharedPreferences prefs;
     private final LinkedHashMap<String, LinkedHashMap<String, CharacterInfo>> profiles = new LinkedHashMap<>();
     private String activeGame = "Без игры";
-    private Spinner gameSpinner, translationModeSpinner;
+    private Spinner gameSpinner;
     private EditText maleNamesInput, femaleNamesInput;
     private LinearLayout[] settingsTabs;
-    private EditText apiKeyInput;
     private boolean updatingGames = false;
     private final ExecutorService translationExecutor = Executors.newSingleThreadExecutor();
-    private final Deque<String> dialogueHistory = new ArrayDeque<>();
     private long translationGeneration = 0;
-    private int translationMode = 0;
     private static final class CharacterInfo {
         String ru;
         boolean male;
@@ -112,32 +113,21 @@ public class MainActivity extends AppCompatActivity {
         }
     }
     private static final String WD_API = "https://www.wikidata.org/w/api.php";
-    private boolean audioMode = false, microphoneActive = false, audioPending = false, audioTtsPlaying = false;
-    private SpeechRecognizer speechRecognizer;
-    private LinearLayout cameraPanel, audioPanel;
-    private TextView audioStatus, audioTranscript;
-    private Spinner modeSpinner, audioGenderSpinner;
-    // Estimate pitch only when the installed Android recognizer provides PCM buffers.
-    private int pitchMaleVotes = 0, pitchFemaleVotes = 0;
-    private String lastAudioText = "";
-    private long lastAudioAt = 0;
-    private final Runnable retryMicrophone = () -> beginListening();
-    private final ActivityResultLauncher<String> microphonePermission = registerForActivityResult(
-        new ActivityResultContracts.RequestPermission(), granted -> {
-            if (granted && audioMode) startMicrophone();
-            else if (!granted && audioMode) show("Разреши доступ к микрофону");
-        });
     private PreviewView preview;
+    private Camera boundCamera;
+    private TextView zoomLabel;
+    private float cameraZoom = 1f;
+    private int cameraOrientation = 0; // 0 auto, 1 portrait, 2 landscape
+
     private RoiOverlay overlay;
     private TextView status, recognized, speedLabel, namesLabel;
-    private ImageView ocrPreview;
-    private Switch showOcrPreviewSwitch;
     private Spinner maleSpinner, femaleSpinner, ttsEngineSpinner;
     private final ArrayList<String> availableTtsEngines = new ArrayList<>();
     private boolean updatingTtsEngineUi = false;
     private String selectedTtsEngine = "";
     private int ttsInitGeneration = 0;
     private Switch translateSwitch;
+    private Button recognitionToggle;
     private TextToSpeech tts;
     private Translator translator;
     private boolean translatorReady = false, ttsReady = false, started = false;
@@ -170,12 +160,14 @@ public class MainActivity extends AppCompatActivity {
         maleIndex = prefs.getInt("maleVoice", 0);
         femaleIndex = prefs.getInt("femaleVoice", 0);
         contrastMode = prefs.getInt("contrastMode", 0);
-        audioMode = prefs.getInt("mode", 0) == 1;
+        cameraZoom = Math.max(1f, Math.min(4f, prefs.getFloat("cameraZoomV112", 1f)));
+        cameraOrientation = Math.max(0, Math.min(2, prefs.getInt("cameraOrientationV112", 0)));
+        applyOrientation(cameraOrientation);
         loadProfiles();
-        translationMode = 0;
         activeGame = prefs.getString("activeGameV16", "Без игры");
         if (!profiles.containsKey(activeGame)) activeGame="Без игры";
         activateGame(activeGame);
+        started=prefs.getBoolean("recognitionActiveV113",true);
         buildUi();
         selectedTtsEngine = prefs.getString("ttsEnginePackageV110", "");
         initializeTts(selectedTtsEngine);
@@ -183,8 +175,7 @@ public class MainActivity extends AppCompatActivity {
             .setSourceLanguage(TranslateLanguage.ENGLISH).setTargetLanguage(TranslateLanguage.RUSSIAN).build();
         translator = Translation.getClient(options);
         if (translateSwitch.isChecked()) prepareTranslator();
-        if (audioMode) requestMicrophone();
-        else requestCamera();
+        requestCamera();
     }
 
     private int dp(float value) { return (int)(getResources().getDisplayMetrics().density * value + .5f); }
@@ -195,177 +186,246 @@ public class MainActivity extends AppCompatActivity {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(Color.rgb(13,18,29));
-        add(root, text("SUBTITLE VOICE", 20));
-        LinearLayout tabBar = new LinearLayout(this);
+        // Android 15+ draws application content behind the navigation bar by default.
+        // Respect system bar and cutout insets so the bottom controls stay accessible.
+        ViewCompat.setOnApplyWindowInsetsListener(root,(view,insets)->{
+            Insets safe=insets.getInsets(WindowInsetsCompat.Type.systemBars()
+                | WindowInsetsCompat.Type.displayCutout());
+            view.setPadding(safe.left,safe.top,safe.right,safe.bottom);
+            return insets;
+        });
+        TextView heading=text("SUBTITLE VOICE",20);
+        heading.setGravity(Gravity.CENTER_VERTICAL);
+        add(root,heading);
+        LinearLayout tabBar=new LinearLayout(this);
         tabBar.setOrientation(LinearLayout.HORIZONTAL);
         add(root,tabBar);
-        ScrollView scroll = new ScrollView(this);
+        ScrollView scroll=new ScrollView(this);
+        scroll.setFillViewport(true);
+        scroll.setClipToPadding(false);
         root.addView(scroll,new LinearLayout.LayoutParams(-1,0,1));
-        LinearLayout holder = new LinearLayout(this);
+        LinearLayout holder=new LinearLayout(this);
         holder.setOrientation(LinearLayout.VERTICAL);
-        holder.setPadding(dp(12),dp(6),dp(12),dp(20));
+        holder.setPadding(dp(12),dp(4),dp(12),dp(32));
         scroll.addView(holder);
-        settingsTabs = new LinearLayout[3];
-        for(int i=0;i<3;i++){
+        settingsTabs=new LinearLayout[3];
+        for(int i=0;i<settingsTabs.length;i++){
             settingsTabs[i]=new LinearLayout(this);
             settingsTabs[i].setOrientation(LinearLayout.VERTICAL);
             add(holder,settingsTabs[i]);
         }
-        String[] tabNames={"Захват","Голоса","Общие"};
+        String[] tabNames={"Общее","Голоса","Игры"};
         for(int i=0;i<tabNames.length;i++){
             final int page=i;
-            Button tab=new Button(this);tab.setText(tabNames[i]);
-            tabBar.addView(tab,new LinearLayout.LayoutParams(0,dp(54),1));
+            Button tab=new Button(this);
+            tab.setText(tabNames[i]);
+            tab.setAllCaps(false);
+            tabBar.addView(tab,new LinearLayout.LayoutParams(0,dp(52),1));
             tab.setOnClickListener(v->{
-                for(int j=0;j<settingsTabs.length;j++) settingsTabs[j].setVisibility(j==page?View.VISIBLE:View.GONE);
+                for(int j=0;j<settingsTabs.length;j++)
+                    settingsTabs[j].setVisibility(j==page?View.VISIBLE:View.GONE);
                 scroll.scrollTo(0,0);
             });
         }
-        for(int i=0;i<settingsTabs.length;i++)settingsTabs[i].setVisibility(i==0?View.VISIBLE:View.GONE);
-        LinearLayout capture=settingsTabs[0], voices=settingsTabs[1], common=settingsTabs[2];
+        for(int i=0;i<settingsTabs.length;i++)
+            settingsTabs[i].setVisibility(i==0?View.VISIBLE:View.GONE);
+        LinearLayout common=settingsTabs[0],voices=settingsTabs[1],games=settingsTabs[2];
 
-        add(capture,text("Режим работы",17));
-        modeSpinner = new Spinner(this);
-        modeSpinner.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,
-            new String[]{"Озвучка по субтитрам","Озвучка по аудио"}));
-        modeSpinner.setSelection(audioMode?1:0);add(capture,modeSpinner);
-        cameraPanel=new LinearLayout(this);cameraPanel.setOrientation(LinearLayout.VERTICAL);add(capture,cameraPanel);
-        audioPanel=new LinearLayout(this);audioPanel.setOrientation(LinearLayout.VERTICAL);add(capture,audioPanel);
-        add(audioPanel,text("Аудио: микрофон → распознавание речи → озвучка; перевод определяется переключателем во вкладке «Общие».",13));
-        audioStatus=text("Микрофон не запущен",13);add(audioPanel,audioStatus);
-        audioTranscript=text("Распознано: —",14);add(audioPanel,audioTranscript);
-        audioGenderSpinner=new Spinner(this);
-        audioGenderSpinner.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,
-            new String[]{"Авто (экспериментально)","Мужской","Женский"}));
-        audioGenderSpinner.setSelection(prefs.getInt("audioGenderMode",0));add(audioPanel,audioGenderSpinner);
-        audioGenderSpinner.setOnItemSelectedListener(new SpinnerListener(i->prefs.edit().putInt("audioGenderMode",i).apply()));
-        Button audioToggle=new Button(this);audioToggle.setText("Запустить / остановить микрофон");add(audioPanel,audioToggle);
-        audioToggle.setOnClickListener(v->{if(microphoneActive)stopMicrophone();else requestMicrophone();});
-        cameraPanel.setVisibility(audioMode?View.GONE:View.VISIBLE);
-        audioPanel.setVisibility(audioMode?View.VISIBLE:View.GONE);
-        modeSpinner.setOnItemSelectedListener(new SpinnerListener(i->switchMode(i==1)));
-        FrameLayout stage=new FrameLayout(this);stage.setBackgroundColor(Color.BLACK);add(cameraPanel,stage);
-        stage.getLayoutParams().height=dp(300);
-        preview=new PreviewView(this);preview.setScaleType(PreviewView.ScaleType.FILL_CENTER);
+        // General: live preview -> recognition switch -> translation switch -> frame accordion.
+        FrameLayout stage=new FrameLayout(this);
+        stage.setBackgroundColor(Color.BLACK);
+        add(common,stage);
+        stage.getLayoutParams().height=dp(getResources().getConfiguration().orientation
+            == Configuration.ORIENTATION_LANDSCAPE ? 230 : 300);
+        preview=new PreviewView(this);
+        preview.setScaleType(PreviewView.ScaleType.FILL_CENTER);
         stage.addView(preview,new FrameLayout.LayoutParams(-1,-1));
-        overlay=new RoiOverlay();stage.addView(overlay,new FrameLayout.LayoutParams(-1,-1));
-        add(cameraPanel,text("Распознаётся только область внутри рамки",12));
-        status=text("Инициализация…",13);add(cameraPanel,status);
-        recognized=text("Последняя реплика: —",14);add(cameraPanel,recognized);
-        showOcrPreviewSwitch=new Switch(this);
-        showOcrPreviewSwitch.setText("Показывать реальный фрагмент OCR");
-        showOcrPreviewSwitch.setTextColor(Color.WHITE);
-        showOcrPreviewSwitch.setChecked(prefs.getBoolean("debugCrop",true));add(cameraPanel,showOcrPreviewSwitch);
-        ocrPreview=new ImageView(this);ocrPreview.setAdjustViewBounds(true);
-        ocrPreview.setScaleType(ImageView.ScaleType.FIT_CENTER);
-        ocrPreview.setBackgroundColor(Color.rgb(28,31,40));ocrPreview.setMaxHeight(dp(130));
-        ocrPreview.setVisibility(showOcrPreviewSwitch.isChecked()?View.VISIBLE:View.GONE);
-        add(cameraPanel,ocrPreview);
-        showOcrPreviewSwitch.setOnCheckedChangeListener((b,on)->{
-            prefs.edit().putBoolean("debugCrop",on).apply();ocrPreview.setVisibility(on?View.VISIBLE:View.GONE);
+        overlay=new RoiOverlay();
+        stage.addView(overlay,new FrameLayout.LayoutParams(-1,-1));
+
+        recognitionToggle=new Button(this);
+        recognitionToggle.setAllCaps(false);
+        add(common,recognitionToggle);
+        updateRecognitionButton();
+        recognitionToggle.setOnClickListener(v->{
+            started=!started;
+            prefs.edit().putBoolean("recognitionActiveV113",started).apply();
+            translationGeneration++;
+            candidate="";attempts=0;
+            if(!started && tts!=null)tts.stop();
+            updateRecognitionButton();
         });
-        Button toggle=new Button(this);toggle.setText("Пауза распознавания");add(cameraPanel,toggle);
-        toggle.setOnClickListener(v->{started=!started;toggle.setText(started?"Пауза распознавания":"Продолжить распознавание");if(!started&&tts!=null)tts.stop();});
-        add(cameraPanel,text("Настройка захвата субтитров",17));
+        translateSwitch=new Switch(this);
+        translateSwitch.setText("Переводить на русский");
+        translateSwitch.setTextColor(Color.WHITE);
+        translateSwitch.setChecked(prefs.getBoolean("translate",true));
+        add(common,translateSwitch);
+        translateSwitch.setOnCheckedChangeListener((button,on)->{
+            prefs.edit().putBoolean("translate",on).apply();
+            translationGeneration++;
+            ocrModeGeneration++;
+            lastSpoken="";candidate="";attempts=0;framesSinceText=0;
+            subtitleCleared=true;recentSpeech.clear();
+            if(tts!=null)tts.stop();
+            if(on)prepareTranslator();
+            if(recognized!=null)recognized.setText(on
+                ? "Распознавание английского текста и перевод"
+                : "Распознавание русского текста без перевода");
+        });
+
+        boolean expanded=prefs.getBoolean("frameSettingsExpandedV113",false);
+        Button frameSettingsToggle=new Button(this);
+        frameSettingsToggle.setAllCaps(false);
+        frameSettingsToggle.setText(expanded?"▾  Настройки рамки и камеры":"▸  Настройки рамки и камеры");
+        add(common,frameSettingsToggle);
+        LinearLayout frameSettings=new LinearLayout(this);
+        frameSettings.setOrientation(LinearLayout.VERTICAL);
+        frameSettings.setPadding(dp(4),0,dp(4),dp(8));
+        frameSettings.setVisibility(expanded?View.VISIBLE:View.GONE);
+        add(common,frameSettings);
+        frameSettingsToggle.setOnClickListener(v->{
+            boolean nowExpanded=frameSettings.getVisibility()!=View.VISIBLE;
+            frameSettings.setVisibility(nowExpanded?View.VISIBLE:View.GONE);
+            frameSettingsToggle.setText(nowExpanded
+                ?"▾  Настройки рамки и камеры":"▸  Настройки рамки и камеры");
+            prefs.edit().putBoolean("frameSettingsExpandedV113",nowExpanded).apply();
+        });
+        add(frameSettings,text("Ориентация камеры",14));
+        Spinner orientationSpinner=new Spinner(this);
+        orientationSpinner.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,
+            new String[]{"Авто (поворот телефона)","Вертикально","Горизонтально"}));
+        orientationSpinner.setSelection(cameraOrientation);
+        add(frameSettings,orientationSpinner);
+        orientationSpinner.setOnItemSelectedListener(new SpinnerListener(i->{
+            if(cameraOrientation!=i){
+                cameraOrientation=i;
+                prefs.edit().putInt("cameraOrientationV112",i).apply();
+                applyOrientation(i);
+            }
+        }));
+        zoomLabel=text("Приближение камеры: "+String.format(Locale.US,"%.1f×",cameraZoom),14);
+        add(frameSettings,zoomLabel);
+        SeekBar cameraZoomBar=new SeekBar(this);
+        cameraZoomBar.setMax(300);
+        cameraZoomBar.setProgress(Math.round((cameraZoom-1f)*100f));
+        add(frameSettings,cameraZoomBar);
+        cameraZoomBar.setOnSeekBarChangeListener(new SimpleSeekListener(v->{
+            cameraZoom=1f+v/100f;
+            prefs.edit().putFloat("cameraZoomV112",cameraZoom).apply();
+            applyCameraZoom();
+        }));
+        add(frameSettings,text("Обработка изображения",14));
         Spinner contrastSpinner=new Spinner(this);
         contrastSpinner.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,
             new String[]{"HD без фильтра","Светлые буквы","Тёмные буквы"}));
-        contrastSpinner.setSelection(contrastMode);add(cameraPanel,contrastSpinner);
-        contrastSpinner.setOnItemSelectedListener(new SpinnerListener(i->{contrastMode=i;prefs.edit().putInt("contrastMode",i).apply();}));
-        addSlider(cameraPanel,"Ширина рамки",55,100,Math.round(widthFrac*100),v->{widthFrac=v/100f;saveRoi();});
-        addSlider(cameraPanel,"Высота рамки",7,35,Math.round(heightFrac*100),v->{heightFrac=v/100f;saveRoi();});
-        addSlider(cameraPanel,"Положение по вертикали",55,95,Math.round(centerYFrac*100),v->{centerYFrac=v/100f;saveRoi();});
+        contrastSpinner.setSelection(contrastMode);
+        add(frameSettings,contrastSpinner);
+        contrastSpinner.setOnItemSelectedListener(new SpinnerListener(i->{
+            contrastMode=i;prefs.edit().putInt("contrastMode",i).apply();
+        }));
+        addSlider(frameSettings,"Ширина рамки",55,100,Math.round(widthFrac*100),v->{widthFrac=v/100f;saveRoi();});
+        addSlider(frameSettings,"Высота рамки",7,35,Math.round(heightFrac*100),v->{heightFrac=v/100f;saveRoi();});
+        addSlider(frameSettings,"Положение по вертикали",55,95,Math.round(centerYFrac*100),v->{centerYFrac=v/100f;saveRoi();});
+        status=text("Инициализация камеры…",13);
+        add(common,status);
+        recognized=text("Последняя реплика: —",14);
+        add(common,recognized);
 
-        add(voices,text("Настройка голосов",18));
-        add(voices,text("Движок озвучки (Android TTS)",14));
+        // Voices: synthesizer, male/female voice models and speed, with no game management.
+        add(voices,text("Движок озвучки",17));
         ttsEngineSpinner=new Spinner(this);add(voices,ttsEngineSpinner);
-        Button scanTts=new Button(this);scanTts.setText("Обновить список движков");add(voices,scanTts);
+        Button scanTts=new Button(this);scanTts.setText("Обновить движки");add(voices,scanTts);
         scanTts.setOnClickListener(v->refreshTtsEngines());
-        Button ttsSettings=new Button(this);ttsSettings.setText("Настройки озвучки Android");add(voices,ttsSettings);
+        Button ttsSettings=new Button(this);
+        ttsSettings.setText("Настройки голосов Android");add(voices,ttsSettings);
         ttsSettings.setOnClickListener(v->{
-            try { startActivity(new Intent("android.settings.TTS_SETTINGS")); }
-            catch(Exception e){ show("Настройки TTS не найдены — открой их в настройках телефона"); }
+            try{startActivity(new Intent("android.settings.TTS_SETTINGS"));}
+            catch(Exception e){show("Настройки TTS можно открыть в настройках телефона");}
         });
-        add(voices,text("Для более естественных голосов установи бесплатный офлайн-движок Piper / HayaiTTS и скачай русские голоса один раз. Во время игры интернет не нужен. Доступны только локальные голоса.",12));
-        add(voices,text("Мужской голос",14));maleSpinner=new Spinner(this);add(voices,maleSpinner);
+        add(voices,text("Мужской голос",14));
+        maleSpinner=new Spinner(this);add(voices,maleSpinner);
         Button testM=new Button(this);testM.setText("Проверить мужской голос");add(voices,testM);
         testM.setOnClickListener(v->speak("Привет! Это пример мужского голоса.",true));
-        add(voices,text("Женский голос",14));femaleSpinner=new Spinner(this);add(voices,femaleSpinner);
+        add(voices,text("Женский голос",14));
+        femaleSpinner=new Spinner(this);add(voices,femaleSpinner);
         Button testF=new Button(this);testF.setText("Проверить женский голос");add(voices,testF);
         testF.setOnClickListener(v->speak("Привет! Это пример женского голоса.",false));
-        add(voices,text("Если персонажу не назначен голос, всегда используется мужской.",13));
-        add(voices,text("Профиль игры",17));
-        gameSpinner=new Spinner(this);add(voices,gameSpinner);
+        speedLabel=text("Скорость речи: "+String.format(Locale.US,"%.2f×",speechRate),16);
+        add(voices,speedLabel);
+        SeekBar speechSlider=new SeekBar(this);
+        speechSlider.setMax(130);
+        speechSlider.setProgress(Math.round((speechRate-.7f)*100));
+        add(voices,speechSlider);
+        speechSlider.setOnSeekBarChangeListener(new SimpleSeekListener(v->{
+            speechRate=.7f+v/100f;
+            speedLabel.setText("Скорость речи: "+String.format(Locale.US,"%.2f×",speechRate));
+            prefs.edit().putFloat("speechRate",speechRate).apply();
+            if(ttsReady && tts!=null)tts.setSpeechRate(speechRate);
+        }));
+        add(voices,text("Персонаж без назначенного голоса всегда говорит мужским. Для дополнительных офлайн-голосов можно установить совместимый TTS-движок.",13));
+
+        // Games: a separate page for profiles, character genders and on-demand import.
+        add(games,text("Профиль игры",17));
+        gameSpinner=new Spinner(this);add(games,gameSpinner);
         refreshGameSpinner();
         gameSpinner.setOnItemSelectedListener(new SpinnerListener(i->{
             if(updatingGames||i<0||i>=profiles.size())return;
             String selected=new ArrayList<>(profiles.keySet()).get(i);
             if(!selected.equals(activeGame)){
-                activeGame=selected;activateGame(activeGame);translationGeneration++;dialogueHistory.clear();renderNames();
+                activeGame=selected;activateGame(activeGame);
+                translationGeneration++;renderNames();
             }
         }));
-        EditText gameInput=new EditText(this);gameInput.setSingleLine(true);gameInput.setTextColor(Color.WHITE);
-        gameInput.setHint("Новая игра, например Final Fantasy VII");add(voices,gameInput);
-        Button addGame=new Button(this);addGame.setText("Создать / выбрать профиль");add(voices,addGame);
+        EditText gameInput=new EditText(this);
+        gameInput.setSingleLine(true);gameInput.setTextColor(Color.WHITE);
+        gameInput.setHint("Новая игра, например Final Fantasy VII");
+        add(games,gameInput);
+        Button addGame=new Button(this);addGame.setText("Создать / выбрать игру");add(games,addGame);
         addGame.setOnClickListener(v->{
             String game=gameInput.getText().toString().trim();if(game.isEmpty())return;
-            profiles.putIfAbsent(game,new LinkedHashMap<>());activeGame=game;
-            activateGame(game);saveProfiles();refreshGameSpinner();renderNames();gameInput.setText("");
-            translationGeneration++;dialogueHistory.clear();
+            profiles.putIfAbsent(game,new LinkedHashMap<>());
+            activeGame=game;activateGame(game);
+            saveProfiles();refreshGameSpinner();renderNames();gameInput.setText("");
+            translationGeneration++;
         });
-        add(voices,text("Мужские персонажи (через запятую)",14));
+        add(games,text("Мужские персонажи (через запятую)",14));
         maleNamesInput=new EditText(this);maleNamesInput.setTextColor(Color.WHITE);
-        maleNamesInput.setHint("Cloud=Клауд, Barret=Баррет");maleNamesInput.setMinLines(2);add(voices,maleNamesInput);
-        add(voices,text("Женские персонажи (через запятую)",14));
+        maleNamesInput.setHint("Cloud=Клауд, Barret=Баррет");maleNamesInput.setMinLines(2);
+        add(games,maleNamesInput);
+        add(games,text("Женские персонажи (через запятую)",14));
         femaleNamesInput=new EditText(this);femaleNamesInput.setTextColor(Color.WHITE);
-        femaleNamesInput.setHint("Tifa=Тифа, Aerith=Айрис");femaleNamesInput.setMinLines(2);add(voices,femaleNamesInput);
-        add(voices,text("Можно вводить просто имена или Имя=Русское произношение. Список сохраняется только в выбранной игре.",12));
-        Button importGame=new Button(this);importGame.setText("Найти персонажей игры в интернете");add(voices,importGame);
+        femaleNamesInput.setHint("Tifa=Тифа, Aerith=Айрис");femaleNamesInput.setMinLines(2);
+        add(games,femaleNamesInput);
+        add(games,text("Формат: Имя=Русское произношение. Списки сохраняются для выбранной игры.",13));
+        Button importGame=new Button(this);
+        importGame.setText("Найти персонажей игры в интернете");add(games,importGame);
         importGame.setOnClickListener(v->{
-            String game=gameInput.getText().toString().trim();if(game.isEmpty())game=activeGame;
-            if(game.equals("Без игры")){Toast.makeText(this,"Сначала выбери или создай игру",Toast.LENGTH_SHORT).show();return;}
+            String game=gameInput.getText().toString().trim();
+            if(game.isEmpty())game=activeGame;
+            if(game.equals("Без игры")){
+                Toast.makeText(this,"Сначала выбери или создай игру",Toast.LENGTH_SHORT).show();return;
+            }
             importCharactersFromWikidata(game,importGame);
         });
-        Button saveNames=new Button(this);saveNames.setText("Сохранить мужские и женские имена");add(voices,saveNames);
+        Button saveNames=new Button(this);
+        saveNames.setText("Сохранить имена персонажей");add(games,saveNames);
         saveNames.setOnClickListener(v->saveCommaSeparatedNames());
-        Button removeGame=new Button(this);removeGame.setText("Удалить выбранный профиль");add(voices,removeGame);
+        Button removeGame=new Button(this);
+        removeGame.setText("Удалить выбранный профиль");add(games,removeGame);
         removeGame.setOnClickListener(v->{
             if("Без игры".equals(activeGame))return;
-            profiles.remove(activeGame);activeGame="Без игры";activateGame(activeGame);
-            saveProfiles();refreshGameSpinner();renderNames();translationGeneration++;dialogueHistory.clear();
-        });
-        namesLabel=text("",12);add(voices,namesLabel);renderNames();
-
-        add(common,text("Общие настройки",18));
-        translateSwitch=new Switch(this);
-        translateSwitch.setText("Переводить на русский");translateSwitch.setTextColor(Color.WHITE);
-        translateSwitch.setChecked(prefs.getBoolean("translate",true));add(common,translateSwitch);
-        translateSwitch.setOnCheckedChangeListener((button,on)->{
-            prefs.edit().putBoolean("translate",on).apply();
+            profiles.remove(activeGame);activeGame="Без игры";
+            activateGame(activeGame);saveProfiles();refreshGameSpinner();renderNames();
             translationGeneration++;
-            ocrModeGeneration++;
-            lastSpoken=""; candidate=""; attempts=0; framesSinceText=0;
-            subtitleCleared=true; recentSpeech.clear();
-            if(tts!=null) tts.stop();
-            if(on) prepareTranslator();
-            if(recognized!=null) recognized.setText(on
-                ? "OCR: английский → перевод на русский"
-                : "OCR: русский → сразу озвучить (без перевода)");
-            if(audioMode && microphoneActive){
-                stopMicrophone();
-                startMicrophone();
-            }
         });
-        add(common,text("ВКЛ — переводить распознанный текст на русский. ВЫКЛ — озвучивать распознанный текст без перевода. Автоматического определения языка нет.",13));
-        speedLabel=text("Скорость речи: "+String.format(Locale.US,"%.2f×",speechRate),16);add(common,speedLabel);
-        SeekBar speechSlider=new SeekBar(this);speechSlider.setMax(130);
-        speechSlider.setProgress(Math.round((speechRate-.7f)*100));add(common,speechSlider);
-        speechSlider.setOnSeekBarChangeListener(new SimpleSeekListener(v->{
-            speechRate=.7f+v/100f;speedLabel.setText("Скорость речи: "+String.format(Locale.US,"%.2f×",speechRate));
-            prefs.edit().putFloat("speechRate",speechRate).apply();if(ttsReady)tts.setSpeechRate(speechRate);
-        }));
-        add(common,text("Перевод и озвучка выполняются локально. Интернет используется только при ручном поиске персонажей и первоначальной загрузке модели.",12));
+        namesLabel=text("",12);add(games,namesLabel);renderNames();
         setContentView(root);
+        ViewCompat.requestApplyInsets(root);
+    }
+
+    private void updateRecognitionButton(){
+        if(recognitionToggle!=null)recognitionToggle.setText(started
+            ?"Остановить распознавание":"Включить распознавание");
     }
 
     private String formattedNames(boolean male){
@@ -659,57 +719,16 @@ public class MainActivity extends AppCompatActivity {
     }
     private void translateOrRead(String input, java.util.function.Consumer<String> success,
                                  java.util.function.Consumer<String> failure) {
-        if(input==null||input.trim().isEmpty())return;
-        if(!translateSwitch.isChecked()){
-            success.accept(input);
+        if(input==null || input.trim().isEmpty())return;
+        if(!translateSwitch.isChecked()) {
+            success.accept(input); // Russian OCR -> original Russian text, NEVER translate.
             return;
         }
-        translateWithContext(input,success,failure);
-    }
-
-    private void translateWithContext(String input, java.util.function.Consumer<String> success, java.util.function.Consumer<String> failure){
-        if(translationMode==0){
-            if(!translatorReady){failure.accept("Ожидаю загрузку офлайн-переводчика");return;}
-            // Name normalization works offline, but ML Kit still translates one phrase at a time.
-            translator.translate(protectNames(input))
-                .addOnSuccessListener(r->{rememberDialogue(input,r);success.accept(r);})
-                .addOnFailureListener(e->failure.accept(e.getMessage()));
-            return;
-        }
-        String key=prefs.getString("onlineApiKeyV16","").trim();
-        if(key.isEmpty()){failure.accept("Добавь OpenAI API-ключ или включи офлайн-перевод");return;}
-        final String game=activeGame, glossarySnapshot=glossary();
-        final ArrayList<String> history=new ArrayList<>(dialogueHistory);
-        translationExecutor.execute(()->{
-            HttpURLConnection conn=null;
-            try{
-                conn=(HttpURLConnection)new URL("https://api.openai.com/v1/chat/completions").openConnection();
-                conn.setRequestMethod("POST");conn.setConnectTimeout(3500);conn.setReadTimeout(7000);
-                conn.setDoOutput(true);conn.setRequestProperty("Content-Type","application/json; charset=utf-8");
-                conn.setRequestProperty("Authorization","Bearer "+key);
-                String rules="Translate the newest English video-game dialogue to natural spoken Russian, not word-for-word. " +
-                    "Preserve meaning, emotions, pronouns and character context. Only output the translation, no commentary. " +
-                    "Game: "+game+". Character name glossary (must use these exact Russian spellings): "+glossarySnapshot+
-                    ". Previous dialogue lines are context ONLY; do not translate them again. Keep the new utterance concise.";
-                JSONArray messages=new JSONArray();
-                messages.put(new JSONObject().put("role","system").put("content",rules));
-                messages.put(new JSONObject().put("role","user").put("content","Context:\n"+String.join("\n",history)+"\nNEW LINE:\n"+input));
-                JSONObject request=new JSONObject().put("model","gpt-4.1-mini").put("messages",messages).put("max_tokens",240).put("temperature",0.25);
-                try(OutputStream out=conn.getOutputStream()){out.write(request.toString().getBytes(StandardCharsets.UTF_8));}
-                int code=conn.getResponseCode();
-                InputStream in=code<300?conn.getInputStream():conn.getErrorStream();
-                byte[] bytes=in.readAllBytes();String body=new String(bytes,StandardCharsets.UTF_8);
-                if(code>=300)throw new Exception("API HTTP "+code+": "+body.substring(0,Math.min(body.length(),180)));
-                String translated=new JSONObject(body).getJSONArray("choices").getJSONObject(0).getJSONObject("message").getString("content").trim();
-                if(translated.isEmpty())throw new Exception("Пустой перевод");
-                handler.post(()->{if(game.equals(activeGame)){rememberDialogue(input,translated);success.accept(translated);}});
-            }catch(Exception e){handler.post(()->failure.accept(e.getMessage()==null?"Сетевая ошибка":e.getMessage()));}
-            finally{if(conn!=null)conn.disconnect();}
-        });
-    }
-    private void rememberDialogue(String source,String translation){
-        dialogueHistory.addLast("EN: "+source+" | RU: "+translation);
-        while(dialogueHistory.size()>8)dialogueHistory.removeFirst();
+        if(!translatorReady){failure.accept("Ожидаю загрузку офлайн-переводчика");return;}
+        // The only translation path is free ML Kit running on the phone.
+        translator.translate(protectNames(input))
+            .addOnSuccessListener(success::accept)
+            .addOnFailureListener(e->failure.accept(e.getMessage()));
     }
     /** Switches the Android speech service without restarting the camera or translator.
      *  Only TTS engines installed by the user can be selected; the app uses no cloud speech API.
@@ -730,11 +749,6 @@ public class MainActivity extends AppCompatActivity {
             if (ttsReady && tts!=null) {
                 tts.setLanguage(new Locale("ru","RU"));
                 tts.setSpeechRate(speechRate);
-                tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
-                    @Override public void onStart(String utteranceId) {}
-                    @Override public void onDone(String utteranceId) { handler.post(() -> onAudioSpeechFinished()); }
-                    @Override public void onError(String utteranceId) { handler.post(() -> onAudioSpeechFinished()); }
-                });
                 refreshTtsEngines();
                 populateVoices();
             } else {
@@ -836,212 +850,107 @@ public class MainActivity extends AppCompatActivity {
         if(russianVoices.isEmpty())show("В выбранном движке нет скачанных офлайн-голосов RU. Установи модель русского голоса в приложении движка.");
     }
     private void prepareTranslator(){
-        if(translatorReady){show("Перевод офлайн готов");return;}
-        show("Подготавливаю языковую модель перевода (первый запуск требует интернет)…");
+        if(translatorReady)return;
         translator.downloadModelIfNeeded(new DownloadConditions.Builder().build())
-          .addOnSuccessListener(v->{translatorReady=true;lastSpoken="";show("Перевод офлайн готов");})
+          .addOnSuccessListener(v->{translatorReady=true;lastSpoken="";})
           .addOnFailureListener(e->show("Не удалось скачать модель перевода: "+e.getMessage()));
     }
     private void requestCamera() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera();
         else cameraPermission.launch(Manifest.permission.CAMERA);
     }
-    private void requestMicrophone() {
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) startMicrophone();
-        else microphonePermission.launch(Manifest.permission.RECORD_AUDIO);
+    private void applyOrientation(int mode) {
+        int target = mode==1 ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_PORTRAIT
+            : mode==2 ? ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            : ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR;
+        if(getRequestedOrientation()!=target) setRequestedOrientation(target);
     }
-    private void switchMode(boolean useAudio) {
-        if (useAudio == audioMode) return;
-        translationGeneration++;
-        audioMode = useAudio;
-        prefs.edit().putInt("mode", audioMode ? 1 : 0).apply();
-        cameraPanel.setVisibility(audioMode ? View.GONE : View.VISIBLE);
-        audioPanel.setVisibility(audioMode ? View.VISIBLE : View.GONE);
-        if (tts != null) tts.stop();
-        audioTtsPlaying = false;
-        audioPending = false;
-        if (audioMode) {
-            started = false;
-            requestMicrophone();
-        } else {
-            stopMicrophone();
-            requestCamera();
-        }
-    }
-    private void startMicrophone() {
-        if (!audioMode) return;
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            audioStatus.setText("На телефоне нет доступной службы распознавания речи Android");
+
+    private void applyCameraZoom() {
+        if(boundCamera==null) {
+            if(zoomLabel!=null)zoomLabel.setText("Приближение камеры: "+String.format(Locale.US,"%.1f×",cameraZoom));
             return;
         }
-        if (speechRecognizer == null) {
-            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
-            speechRecognizer.setRecognitionListener(new RecognitionListener() {
-                @Override public void onReadyForSpeech(Bundle b) { audioStatus.setText("Слушаю английскую речь…"); }
-                @Override public void onBeginningOfSpeech() { audioStatus.setText("Слышу речь…"); }
-                @Override public void onRmsChanged(float rms) {}
-                @Override public void onBufferReceived(byte[] bytes) { estimateVoicePitch(bytes); }
-                @Override public void onEndOfSpeech() { audioStatus.setText("Распознаю…"); }
-                @Override public void onError(int code) {
-                    if (!microphoneActive || !audioMode) return;
-                    if (code == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
-                        audioStatus.setText("Нет разрешения на микрофон"); stopMicrophone(); return;
-                    }
-                    audioStatus.setText("Перезапуск прослушивания (" + code + ")…");
-                    if (!audioPending && !audioTtsPlaying) scheduleMicrophone(600);
-                }
-                @Override public void onResults(Bundle results) {
-                    if (!microphoneActive || !audioMode) return;
-                    ArrayList<String> list = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
-                    String phrase = list == null || list.isEmpty() ? "" : list.get(0).trim();
-                    if (phrase.isEmpty()) { scheduleMicrophone(250); return; }
-                    handleAudioPhrase(phrase);
-                }
-                @Override public void onPartialResults(Bundle results) {
-                    ArrayList<String> list = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
-                    if (microphoneActive && audioMode && list != null && !list.isEmpty())
-                        audioTranscript.setText("Слышу: " + list.get(0));
-                }
-                @Override public void onEvent(int type, Bundle params) {}
-            });
-        }
-        microphoneActive = true;
-        beginListening();
+        ZoomState state=boundCamera.getCameraInfo().getZoomState().getValue();
+        float minimum=state!=null?state.getMinZoomRatio():1f;
+        float maximum=state!=null?state.getMaxZoomRatio():1f;
+        float actual=Math.max(minimum,Math.min(cameraZoom,maximum));
+        if(zoomLabel!=null)zoomLabel.setText("Приближение камеры: "+String.format(Locale.US,"%.1f×",actual));
+        boundCamera.getCameraControl().setZoomRatio(actual);
     }
-    private void beginListening() {
-        if (!audioMode || !microphoneActive || audioPending || audioTtsPlaying || speechRecognizer == null) return;
-        pitchMaleVotes = 0; pitchFemaleVotes = 0;
-        Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
-        intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, translateSwitch.isChecked()?"en-US":"ru-RU");
-        intent.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true);
-        intent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
-        intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
-        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 400L);
-        intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 300L);
-        try { speechRecognizer.startListening(intent); }
-        catch (Exception e) { audioStatus.setText("Ошибка микрофона: " + e.getMessage()); }
-    }
-    private void scheduleMicrophone(long delay) {
-        handler.removeCallbacks(retryMicrophone);
-        if (microphoneActive && audioMode && !audioPending && !audioTtsPlaying)
-            handler.postDelayed(retryMicrophone, delay);
-    }
-    private void stopMicrophone() {
-        microphoneActive = false;
-        audioPending = false;
-        handler.removeCallbacks(retryMicrophone);
-        if (speechRecognizer != null) speechRecognizer.cancel();
-        if (audioStatus != null) audioStatus.setText("Микрофон остановлен");
-    }
-    /** A conservative approximation, not a biological gender classifier.
-     * Android recognition services may never invoke onBufferReceived; in that case
-     * the fallback voice is used. PCM16 16-kHz data is assumed only for this optional estimate.
-     */
-    private void estimateVoicePitch(byte[] pcm) {
-        if (pcm == null || pcm.length < 1024 || pcm.length > 64000) return;
-        int length = Math.min(pcm.length / 2, 4096);
-        float[] samples = new float[length];
-        double energy = 0;
-        for (int i=0; i<length; i++) {
-            int lo = pcm[2*i] & 0xff;
-            short sample = (short) ((pcm[2*i+1] << 8) | lo);
-            samples[i] = sample / 32768f;
-            energy += samples[i] * samples[i];
-        }
-        if (energy / length < .001) return;
-        // 16-kHz autocorrelation of voiced frames, 85–300 Hz.
-        int minLag = 16000/300, maxLag = Math.min(length/2,16000/85);
-        double best = 0; int peak = 0;
-        for (int lag=minLag; lag<=maxLag; lag+=2) {
-            double correlation=0, power=0;
-            for(int j=0;j<length-lag;j+=3) {
-                correlation += samples[j]*samples[j+lag];
-                power += samples[j]*samples[j];
-            }
-            if(power>0 && correlation/power>best) {best=correlation/power;peak=lag;}
-        }
-        if(best<.62 || peak==0) return;
-        float f0 = 16000f / peak;
-        if (f0 < 155) pitchMaleVotes++;
-        else if(f0 > 190) pitchFemaleVotes++;
-    }
-    private boolean audioMaleVoice() {
-        int selected=audioGenderSpinner.getSelectedItemPosition();
-        if (selected==1) return true;
-        if (selected==2) return false;
-        if (pitchMaleVotes + pitchFemaleVotes < 3 || Math.abs(pitchMaleVotes-pitchFemaleVotes)<2)
-            return true;
-        return pitchMaleVotes>pitchFemaleVotes;
-    }
-    private void handleAudioPhrase(String phrase) {
-        long now = System.currentTimeMillis();
-        audioTranscript.setText("Распознано: " + phrase);
-        if (phrase.equalsIgnoreCase(lastAudioText) && now-lastAudioAt<4000) {
-            scheduleMicrophone(250); return;
-        }
-        lastAudioText=phrase; lastAudioAt=now;
-        final boolean male=audioMaleVoice();
-        audioPending=true;
-        final long generation=translationGeneration;
-        translateOrRead(phrase,r->{
-            if(generation==translationGeneration && audioMode && microphoneActive)speakAudio(r,male);
-            else audioPending=false;
-        },error->{
-            audioPending=false;
-            audioStatus.setText("Ошибка перевода: " + error);
-            scheduleMicrophone(350);
-        });
-    }
-    private void speakAudio(String text, boolean male) {
-        audioPending=false;
-        if (!microphoneActive || !audioMode) return;
-        if (!ttsReady || text.trim().isEmpty()) { scheduleMicrophone(300); return; }
-        audioTtsPlaying=true;
-        audioStatus.setText("Озвучиваю: " + text);
-        speak(text,male);
-    }
-    private void onAudioSpeechFinished() {
-        if (audioTtsPlaying) {
-            audioTtsPlaying=false;
-            scheduleMicrophone(200);
-        }
-    }
+
     private void startCamera(){
+        if(preview==null) return;
+        if(preview.getWidth()==0 || preview.getHeight()==0 || preview.getDisplay()==null) {
+            preview.post(() -> {if(!isFinishing())startCamera();});
+            return;
+        }
         ListenableFuture<ProcessCameraProvider> future=ProcessCameraProvider.getInstance(this);
         future.addListener(()->{
             try{
-                ProcessCameraProvider provider=future.get();provider.unbindAll();
-                Preview p=new Preview.Builder().build();p.setSurfaceProvider(preview.getSurfaceProvider());
+                if(isFinishing())return;
+                ProcessCameraProvider provider=future.get();
+                provider.unbindAll();
+                int displayRotation=preview.getDisplay().getRotation();
+                boolean horizontal=displayRotation==Surface.ROTATION_90 || displayRotation==Surface.ROTATION_270;
+                Size targetSize=new Size(horizontal ? 1920 : 1080, horizontal ? 1080 : 1920);
+                Preview p=new Preview.Builder().setTargetRotation(displayRotation).build();
+                p.setSurfaceProvider(preview.getSurfaceProvider());
                 ImageAnalysis analysis = new ImageAnalysis.Builder()
-                    .setTargetResolution(new Size(1280, 720))
+                    .setTargetResolution(targetSize)
+                    .setTargetRotation(displayRotation)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .build();
+                // A common ViewPort makes the OCR bitmap correspond to the green preview frame.
+                ViewPort viewPort=preview.getViewPort();
+                final boolean viewportMapped=viewPort!=null;
                 analysis.setAnalyzer(cameraExecutor, frame -> {
-                    if (audioMode || !started || busy) {frame.close();return;}
+                    if (!started || busy) {frame.close();return;}
                     busy=true;
+                    Bitmap full=null,viewportBitmap=null,oriented=null;
                     try {
-                        Bitmap captured=bitmapFromFrame(frame);
+                        full=bitmapFromFrame(frame);
+                        viewportBitmap=full;
+                        if(viewportMapped) {
+                            Rect c=frame.getCropRect();
+                            int left=Math.max(0,Math.min(full.getWidth()-1,c.left));
+                            int top=Math.max(0,Math.min(full.getHeight()-1,c.top));
+                            int cw=Math.min(full.getWidth()-left,c.width());
+                            int ch=Math.min(full.getHeight()-top,c.height());
+                            if(cw>0 && ch>0 && (cw!=full.getWidth() || ch!=full.getHeight()))
+                                viewportBitmap=Bitmap.createBitmap(full,left,top,cw,ch);
+                        }
                         int rotation=frame.getImageInfo().getRotationDegrees();
-                        frame.close();
-                        Bitmap oriented=captured;
+                        oriented=viewportBitmap;
                         if(rotation!=0){
                             Matrix rotate=new Matrix(); rotate.postRotate(rotation);
-                            oriented=Bitmap.createBitmap(captured,0,0,captured.getWidth(),captured.getHeight(),rotate,true);
-                            captured.recycle();
+                            oriented=Bitmap.createBitmap(viewportBitmap,0,0,
+                                viewportBitmap.getWidth(),viewportBitmap.getHeight(),rotate,true);
                         }
-                        Bitmap cropped=cropToOverlay(oriented);
-                        oriented.recycle();
+                        Bitmap cropped=cropToOverlay(oriented,viewportMapped);
                         if(cropped==null){busy=false;return;}
                         runOnUiThread(()->recognizeFrame(cropped));
                     }catch(Exception e){
-                        frame.close(); busy=false;
+                        busy=false;
                         runOnUiThread(()->show("Ошибка кадра: "+e.getMessage()));
+                    }finally{
+                        frame.close();
+                        if(oriented!=null && oriented!=viewportBitmap && oriented!=full)oriented.recycle();
+                        if(viewportBitmap!=null && viewportBitmap!=full)viewportBitmap.recycle();
+                        if(full!=null)full.recycle();
                     }
                 });
-                provider.bindToLifecycle(this,CameraSelector.DEFAULT_BACK_CAMERA,p,analysis);
-                started=true;show("Камера HD готова. Наведи рамку на субтитры");
+                if(viewportMapped){
+                    UseCaseGroup group=new UseCaseGroup.Builder()
+                        .addUseCase(p).addUseCase(analysis).setViewPort(viewPort).build();
+                    boundCamera=provider.bindToLifecycle(this,CameraSelector.DEFAULT_BACK_CAMERA,group);
+                }else{
+                    boundCamera=provider.bindToLifecycle(this,CameraSelector.DEFAULT_BACK_CAMERA,p,analysis);
+                }
+                applyCameraZoom();
+                updateRecognitionButton();
+                show("Камера Full HD запущена (если поддерживается устройством)");
             }catch(Exception ex){show("Ошибка камеры: "+ex.getMessage());}
         }, ContextCompat.getMainExecutor(this));
     }
@@ -1059,22 +968,31 @@ public class MainActivity extends AppCompatActivity {
         bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(rgba));
         return bitmap;
     }
-    /** PreviewView uses FILL_CENTER; map the visible rectangle back to full-resolution frame. */
-    private Bitmap cropToOverlay(Bitmap frame){
+    /** Crop exactly the green-frame area. With CameraX ViewPort, normalized coordinates match PreviewView. */
+    private Bitmap cropToOverlay(Bitmap frame,boolean viewportMapped){
         int vw=preview.getWidth(),vh=preview.getHeight();
         if(vw<=0||vh<=0)return null;
         int w=frame.getWidth(),h=frame.getHeight();
-        float scale=Math.max(vw/(float)w,vh/(float)h);
-        float visibleW=vw/scale, visibleH=vh/scale;
-        float offsetX=(w-visibleW)/2f,offsetY=(h-visibleH)/2f;
-        float rw=vw*widthFrac,rh=vh*heightFrac;
-        float leftInView=(vw-rw)/2f;
-        float topInView=Math.max(0,Math.min(vh-rh,vh*centerYFrac-rh/2f));
-        int left=Math.max(0,Math.min(w-1,Math.round(offsetX+leftInView/scale)));
-        int top=Math.max(0,Math.min(h-1,Math.round(offsetY+topInView/scale)));
-        int cropW=Math.min(w-left,Math.max(20,Math.round(rw/scale)));
-        int cropH=Math.min(h-top,Math.max(20,Math.round(rh/scale)));
-        return Bitmap.createBitmap(frame,left,top,cropW,cropH);
+        float left,top,regionW,regionH;
+        if(viewportMapped){
+            regionW=w*widthFrac;
+            regionH=h*heightFrac;
+            left=(w-regionW)/2f;
+            top=Math.max(0,Math.min(h-regionH,h*centerYFrac-regionH/2f));
+        }else{
+            float scale=Math.max(vw/(float)w,vh/(float)h);
+            float visibleW=vw/scale,visibleH=vh/scale;
+            float offsetX=(w-visibleW)/2f,offsetY=(h-visibleH)/2f;
+            float rw=vw*widthFrac,rh=vh*heightFrac;
+            left=offsetX+(vw-rw)/2f/scale;
+            top=offsetY+Math.max(0,Math.min(vh-rh,vh*centerYFrac-rh/2f))/scale;
+            regionW=rw/scale;regionH=rh/scale;
+        }
+        int x=Math.max(0,Math.min(w-1,Math.round(left)));
+        int y=Math.max(0,Math.min(h-1,Math.round(top)));
+        int cw=Math.min(w-x,Math.max(1,Math.round(regionW)));
+        int ch=Math.min(h-y,Math.max(1,Math.round(regionH)));
+        return Bitmap.createBitmap(frame,x,y,cw,ch);
     }
     /** Bundled Russian model is copied to app-private storage ONCE; no network use on the phone. */
     private void ensureRussianOcr() throws IOException {
@@ -1152,6 +1070,19 @@ public class MainActivity extends AppCompatActivity {
         return normalized;
     }
 
+    private static int textLength(String value){return value==null?0:value.trim().length();}
+
+    private Bitmap enlargeSmallRussianCaption(Bitmap source){
+        int w=source.getWidth(),h=source.getHeight();
+        // Limit work on slow phones. Scaling cannot recover detail lost by the camera;
+        // use the optical/digital camera zoom slider to get more real glyph pixels.
+        float scale=Math.min(3f,Math.max(1f,340f/Math.max(1,h)));
+        scale=Math.min(scale,Math.min(2800f/Math.max(1,w),850f/Math.max(1,h)));
+        if(scale<=1.08f)return source;
+        return Bitmap.createScaledBitmap(source,
+            Math.max(1,Math.round(w*scale)),Math.max(1,Math.round(h*scale)),true);
+    }
+
     /** Never route Cyrillic captions to ML Kit's Latin OCR. Keep Tesseract off the UI thread. */
     private void recognizeRussianFrame(Bitmap crop, long modeGeneration) {
         final int filter = contrastMode;
@@ -1159,23 +1090,30 @@ public class MainActivity extends AppCompatActivity {
             Bitmap prepared = null;
             try {
                 ensureRussianOcr();
-                // Upscale only short crops; scaling every full-size frame would add latency.
-                prepared = filter == 0 ? crop : enhanceSubtitleText(crop,filter==1);
-                if(prepared.getHeight()<135){
-                    Bitmap enlarged=Bitmap.createScaledBitmap(prepared,
-                        Math.round(prepared.getWidth()*1.5f),
-                        Math.round(prepared.getHeight()*1.5f),true);
-                    if(enlarged!=prepared){
-                        if(prepared!=crop)prepared.recycle();
-                        prepared=enlarged;
-                    }
+                // Resize based on the small OCR strip, not the size of the entire camera preview.
+                // It helps Tesseract interpret narrow glyph strokes when the phone is far away.
+                if(filter == 0) {
+                    prepared = enlargeSmallRussianCaption(crop);
+                } else {
+                    prepared = enhanceSubtitleText(crop,filter==1);
                 }
                 russianOcr.setImage(prepared);
                 String text=russianOcr.getUTF8Text();
+                // Only spend time on a second OCR attempt when the first pass found nothing useful.
+                if(filter==0 && (text==null || text.trim().length()<3)) {
+                    Bitmap fallback=null;
+                    try {
+                        fallback=enhanceSubtitleText(crop,true);
+                        russianOcr.setImage(fallback);
+                        String second=russianOcr.getUTF8Text();
+                        if(second!=null && second.trim().length()>textLength(text))text=second;
+                    } finally {if(fallback!=null)fallback.recycle();}
+                }
+                final String recognizedText=text;
                 handler.post(() -> {
-                    if(!isFinishing() && !isDestroyed() && !audioMode &&
+                    if(!isFinishing() && !isDestroyed() && started &&
                         !translateSwitch.isChecked() && ocrModeGeneration==modeGeneration) {
-                        SubtitleData data=extractRussianSubtitle(text);
+                        SubtitleData data=extractRussianSubtitle(recognizedText);
                         if(data.speech.isEmpty())recognized.setText("OCR RU: текст в рамке не найден");
                         onRecognition(data); // translateOrRead() will return the original text.
                     }
@@ -1196,16 +1134,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void recognizeFrame(Bitmap crop){
-        // Show the EXACT cropped bitmap passed to the OCR engine, not the camera preview.
-        if (showOcrPreviewSwitch != null && showOcrPreviewSwitch.isChecked()) {
-            float shrink = Math.min(1f, 800f / crop.getWidth());
-            Bitmap diagnostic = Bitmap.createScaledBitmap(crop,
-                Math.max(1, Math.round(crop.getWidth() * shrink)),
-                Math.max(1, Math.round(crop.getHeight() * shrink)), true);
-            // createScaledBitmap can return the original object when dimensions match.
-            if (diagnostic == crop) diagnostic = crop.copy(Bitmap.Config.ARGB_8888, false);
-            ocrPreview.setImageBitmap(diagnostic);
-        }
+        if(!started){crop.recycle();busy=false;return;}
         // THE LANGUAGE SWITCH IS THE ONLY INPUT-LANGUAGE SELECTOR:
         // OFF => Russian OCR, no translation. ON => English OCR + Russian translation.
         if(!translateSwitch.isChecked()) {
@@ -1410,7 +1339,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void onRecognition(SubtitleData data){
-        if (audioMode) return;
+        if (!started) return;
         final long now=System.currentTimeMillis();
         String cleaned=data.speech.replaceAll("\\s+"," ").trim();
         if(!data.speaker.isEmpty()){
@@ -1456,7 +1385,7 @@ public class MainActivity extends AppCompatActivity {
         final String fingerprint=cleaned;
         final long generation=translationGeneration;
         translateOrRead(cleaned, translated->{
-            if(generation==translationGeneration && fingerprint.equals(lastSpoken) && !audioMode){
+            if(started && generation==translationGeneration && fingerprint.equals(lastSpoken)){
                 recognized.setText("Озвучка: "+translated);
                 speak(translated,male);
             }
@@ -1489,9 +1418,7 @@ public class MainActivity extends AppCompatActivity {
         }
     }
     @Override protected void onDestroy(){
-        stopMicrophone();
         translationExecutor.shutdownNow();
-        if (speechRecognizer != null) {speechRecognizer.destroy();speechRecognizer=null;}
         handler.removeCallbacksAndMessages(null);started=false;
         recognizer.close();cameraExecutor.shutdown();if(translator!=null)translator.close();
         russianOcrExecutor.execute(() -> {if(russianOcr!=null){russianOcr.recycle();russianOcr=null;}});
