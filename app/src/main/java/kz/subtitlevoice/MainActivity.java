@@ -123,7 +123,11 @@ public class MainActivity extends AppCompatActivity {
     private TextView status, recognized, speedLabel, namesLabel;
     private ImageView ocrPreview;
     private Switch showOcrPreviewSwitch;
-    private Spinner maleSpinner, femaleSpinner;
+    private Spinner maleSpinner, femaleSpinner, ttsEngineSpinner;
+    private final ArrayList<String> availableTtsEngines = new ArrayList<>();
+    private boolean updatingTtsEngineUi = false;
+    private String selectedTtsEngine = "";
+    private int ttsInitGeneration = 0;
     private Switch translateSwitch;
     private TextToSpeech tts;
     private Translator translator;
@@ -163,18 +167,8 @@ public class MainActivity extends AppCompatActivity {
         if (!profiles.containsKey(activeGame)) activeGame="Без игры";
         activateGame(activeGame);
         buildUi();
-        tts = new TextToSpeech(this, code -> handler.post(() -> {
-            ttsReady = code == TextToSpeech.SUCCESS;
-            if (ttsReady) {
-                tts.setLanguage(new Locale("ru", "RU")); populateVoices();
-                tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
-                    @Override public void onStart(String id) {}
-                    @Override public void onDone(String id) { handler.post(() -> onAudioSpeechFinished()); }
-                    @Override public void onError(String id) { handler.post(() -> onAudioSpeechFinished()); }
-                });
-            }
-            else show("Не найден движок озвучки Android");
-        }));
+        selectedTtsEngine = prefs.getString("ttsEnginePackageV110", "");
+        initializeTts(selectedTtsEngine);
         TranslatorOptions options = new TranslatorOptions.Builder()
             .setSourceLanguage(TranslateLanguage.ENGLISH).setTargetLanguage(TranslateLanguage.RUSSIAN).build();
         translator = Translation.getClient(options);
@@ -273,6 +267,16 @@ public class MainActivity extends AppCompatActivity {
         addSlider(cameraPanel,"Положение по вертикали",55,95,Math.round(centerYFrac*100),v->{centerYFrac=v/100f;saveRoi();});
 
         add(voices,text("Настройка голосов",18));
+        add(voices,text("Движок озвучки (Android TTS)",14));
+        ttsEngineSpinner=new Spinner(this);add(voices,ttsEngineSpinner);
+        Button scanTts=new Button(this);scanTts.setText("Обновить список движков");add(voices,scanTts);
+        scanTts.setOnClickListener(v->refreshTtsEngines());
+        Button ttsSettings=new Button(this);ttsSettings.setText("Настройки озвучки Android");add(voices,ttsSettings);
+        ttsSettings.setOnClickListener(v->{
+            try { startActivity(new Intent("android.settings.TTS_SETTINGS")); }
+            catch(Exception e){ show("Настройки TTS не найдены — открой их в настройках телефона"); }
+        });
+        add(voices,text("Для более естественных голосов установи бесплатный офлайн-движок Piper / HayaiTTS и скачай русские голоса один раз. Во время игры интернет не нужен. Доступны только локальные голоса.",12));
         add(voices,text("Мужской голос",14));maleSpinner=new Spinner(this);add(voices,maleSpinner);
         Button testM=new Button(this);testM.setText("Проверить мужской голос");add(voices,testM);
         testM.setOnClickListener(v->speak("Привет! Это пример мужского голоса.",true));
@@ -685,18 +689,129 @@ public class MainActivity extends AppCompatActivity {
         dialogueHistory.addLast("EN: "+source+" | RU: "+translation);
         while(dialogueHistory.size()>8)dialogueHistory.removeFirst();
     }
+    /** Switches the Android speech service without restarting the camera or translator.
+     *  Only TTS engines installed by the user can be selected; the app uses no cloud speech API.
+     */
+    private void initializeTts(String packageName) {
+        final int generation = ++ttsInitGeneration;
+        ttsReady=false;
+        selectedTtsEngine=packageName == null ? "" : packageName;
+        if (tts!=null) {
+            tts.stop();
+            tts.shutdown();
+            tts=null;
+        }
+        russianVoices.clear();
+        TextToSpeech.OnInitListener callback = code -> handler.post(() -> {
+            if (isFinishing() || isDestroyed() || generation!=ttsInitGeneration) return;
+            ttsReady=code==TextToSpeech.SUCCESS;
+            if (ttsReady && tts!=null) {
+                tts.setLanguage(new Locale("ru","RU"));
+                tts.setSpeechRate(speechRate);
+                tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                    @Override public void onStart(String utteranceId) {}
+                    @Override public void onDone(String utteranceId) { handler.post(() -> onAudioSpeechFinished()); }
+                    @Override public void onError(String utteranceId) { handler.post(() -> onAudioSpeechFinished()); }
+                });
+                refreshTtsEngines();
+                populateVoices();
+            } else {
+                refreshTtsEngines();
+                show("Не удалось запустить выбранный TTS-движок. Проверь его установку и языковые модели.");
+            }
+        });
+        tts=selectedTtsEngine.isEmpty()
+            ? new TextToSpeech(this,callback)
+            : new TextToSpeech(this,callback,selectedTtsEngine);
+    }
+
+    private String ttsEnginePreferenceKey(String suffix){
+        return "offlineTts_"+(selectedTtsEngine.isEmpty()?"system":selectedTtsEngine)+"_"+suffix;
+    }
+
+    private void refreshTtsEngines(){
+        if(ttsEngineSpinner==null || tts==null)return;
+        ArrayList<String> labels=new ArrayList<>();
+        availableTtsEngines.clear();
+        availableTtsEngines.add("");
+        labels.add("Системный движок Android");
+        try {
+            List<TextToSpeech.EngineInfo> installed=tts.getEngines();
+            if(installed!=null)for(TextToSpeech.EngineInfo info:installed){
+                if(info.name==null || info.name.trim().isEmpty())continue;
+                availableTtsEngines.add(info.name);
+                String title=info.label==null || info.label.trim().isEmpty()?info.name:info.label;
+                labels.add(title+" ("+info.name+")");
+            }
+        }catch(Exception ignored){}
+        int selected=Math.max(0,availableTtsEngines.indexOf(selectedTtsEngine));
+        updatingTtsEngineUi=true;
+        ttsEngineSpinner.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,labels));
+        ttsEngineSpinner.setSelection(selected);
+        ttsEngineSpinner.setOnItemSelectedListener(new SpinnerListener(position->{
+            if(updatingTtsEngineUi || position<0 || position>=availableTtsEngines.size())return;
+            String next=availableTtsEngines.get(position);
+            if(next.equals(selectedTtsEngine))return;
+            prefs.edit().putString("ttsEnginePackageV110",next).apply();
+            initializeTts(next);
+        }));
+        updatingTtsEngineUi=false;
+    }
+
+    private int storedVoiceIndex(boolean male){
+        if(russianVoices.isEmpty())return 0;
+        String key=ttsEnginePreferenceKey(male?"maleName":"femaleName");
+        String name=prefs.getString(key,"");
+        for(int i=0;i<russianVoices.size();i++)if(russianVoices.get(i).getName().equals(name))return i+1;
+        // Migrate previously selected system voices only; engine-specific voices
+        // must not inherit an unrelated numeric index from the old TTS engine.
+        if(selectedTtsEngine.isEmpty() && !prefs.contains(key)){
+            int old=male?maleIndex:femaleIndex;
+            if(old>0 && old<=russianVoices.size())return old;
+        }
+        // Engine metadata does not explicitly carry gender. Prefer recognizable
+        // Russian male/female model names when no personal choice was saved.
+        String[] preferred=male
+            ? new String[]{"denis","dmitri","ruslan","yuriy","aleksey","alexey","pavel","seva","artem","igor"}
+            : new String[]{"irina","anna","luka","alina","elena","maria","tatyana","tatiana","natalia"};
+        for(String hint:preferred){
+            for(int i=0;i<russianVoices.size();i++){
+                if(russianVoices.get(i).getName().toLowerCase(Locale.ROOT).contains(hint))return i+1;
+            }
+        }
+        return 0;
+    }
+
     private void populateVoices(){
         russianVoices.clear();
-        if(tts.getVoices()!=null)for(Voice voice:tts.getVoices())if("ru".equals(voice.getLocale().getLanguage()))russianVoices.add(voice);
+        if(tts==null || !ttsReady || maleSpinner==null || femaleSpinner==null)return;
+        try {
+            Set<Voice> installed=tts.getVoices();
+            if(installed!=null)for(Voice v:installed){
+                if(v!=null && v.getLocale()!=null &&
+                   "ru".equals(v.getLocale().getLanguage()) &&
+                   !v.isNetworkConnectionRequired())russianVoices.add(v);
+            }
+        }catch(Exception ex){show("Не получилось прочитать голоса TTS: "+ex.getMessage());}
         russianVoices.sort(Comparator.comparing(Voice::getName));
-        List<String> titles=new ArrayList<>();titles.add("Системный русский голос");
-        for(Voice voice:russianVoices)titles.add(voice.getName()+(voice.isNetworkConnectionRequired()?" (интернет)":" (офлайн)"));
-        ArrayAdapter<String> adapterM=new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,titles);
-        ArrayAdapter<String> adapterF=new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,titles);
-        maleSpinner.setAdapter(adapterM); femaleSpinner.setAdapter(adapterF);
-        maleSpinner.setSelection(Math.min(maleIndex,titles.size()-1)); femaleSpinner.setSelection(Math.min(femaleIndex,titles.size()-1));
-        maleSpinner.setOnItemSelectedListener(new SpinnerListener(n->{maleIndex=n;prefs.edit().putInt("maleVoice",n).apply();}));
-        femaleSpinner.setOnItemSelectedListener(new SpinnerListener(n->{femaleIndex=n;prefs.edit().putInt("femaleVoice",n).apply();}));
+        List<String> titles=new ArrayList<>();
+        titles.add("Автоматически: первый офлайн-голос RU");
+        for(Voice v:russianVoices)titles.add(v.getName()+" (офлайн)");
+        maleSpinner.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,titles));
+        femaleSpinner.setAdapter(new ArrayAdapter<>(this,android.R.layout.simple_spinner_dropdown_item,titles));
+        maleSpinner.setSelection(storedVoiceIndex(true));
+        femaleSpinner.setSelection(storedVoiceIndex(false));
+        maleSpinner.setOnItemSelectedListener(new SpinnerListener(n->{
+            maleIndex=n;
+            String name=n>0 && n<=russianVoices.size()?russianVoices.get(n-1).getName():"";
+            prefs.edit().putString(ttsEnginePreferenceKey("maleName"),name).putInt("maleVoice",n).apply();
+        }));
+        femaleSpinner.setOnItemSelectedListener(new SpinnerListener(n->{
+            femaleIndex=n;
+            String name=n>0 && n<=russianVoices.size()?russianVoices.get(n-1).getName():"";
+            prefs.edit().putString(ttsEnginePreferenceKey("femaleName"),name).putInt("femaleVoice",n).apply();
+        }));
+        if(russianVoices.isEmpty())show("В выбранном движке нет скачанных офлайн-голосов RU. Установи модель русского голоса в приложении движка.");
     }
     private void prepareTranslator(){
         if(translatorReady){show("Перевод офлайн готов");return;}
@@ -1200,10 +1315,19 @@ public class MainActivity extends AppCompatActivity {
         }, error->show("Ошибка перевода: "+error));
     }
     private void speak(String phrase, boolean male){
-        if(!ttsReady||phrase.trim().isEmpty())return;
-        tts.setLanguage(new Locale("ru","RU"));
+        if(!ttsReady || tts==null || phrase==null || phrase.trim().isEmpty())return;
+        if(russianVoices.isEmpty()){
+            show("Нет локальной русской голосовой модели в выбранном TTS-движке");
+            return;
+        }
         int index=male?maleIndex:femaleIndex;
-        if(index>0&&index<=russianVoices.size())tts.setVoice(russianVoices.get(index-1));
+        // Gender is chosen from the game profile. Unassigned characters always use male.
+        if(index<1 || index>russianVoices.size())index=1;
+        Voice voice=russianVoices.get(index-1);
+        if(tts.setVoice(voice)==TextToSpeech.ERROR){
+            show("Движок не смог включить голос: "+voice.getName());
+            return;
+        }
         tts.setSpeechRate(speechRate);
         tts.speak(phrase,TextToSpeech.QUEUE_FLUSH,null,"subtitle-"+System.nanoTime());
     }
@@ -1221,5 +1345,8 @@ public class MainActivity extends AppCompatActivity {
         translationExecutor.shutdownNow();
         if (speechRecognizer != null) {speechRecognizer.destroy();speechRecognizer=null;}
         handler.removeCallbacksAndMessages(null);started=false;
-        recognizer.close();cameraExecutor.shutdown();if(translator!=null)translator.close();if(tts!=null){tts.stop();tts.shutdown();}super.onDestroy();}
+        recognizer.close();cameraExecutor.shutdown();if(translator!=null)translator.close();
+        ++ttsInitGeneration;
+        if(tts!=null){tts.stop();tts.shutdown();tts=null;}
+        super.onDestroy();}
 }
